@@ -1,17 +1,18 @@
 # mdview 개발 정리 및 설치 안내
 
-버전: 0.2.0 · 갱신일: 2026-09-11 (최초 작성 2026-09-10)
+버전: 0.3.0 · 갱신일: 2026-09-11 (최초 작성 2026-09-10)
 
 ## 1. 개요
 
 mdview는 [glow](https://github.com/charmbracelet/glow)와 같은 터미널 마크다운 뷰어를 Rust로 구현한 프로그램입니다.
 마크다운 파일, 표준입력, 원격 URL을 색과 스타일을 입혀 터미널에 출력하고, 스크롤·검색이 되는 페이저와
 마크다운 파일 브라우저, 로컬 즐겨찾기(스태시)를 제공합니다.
-0.2.0부터 수식(LaTeX), HTML 표 병합, mermaid 다이어그램을 터미널 문자로 조판합니다.
+0.2.0부터 수식(LaTeX), HTML 표 병합, mermaid 다이어그램을 터미널 문자로 조판하고,
+0.3.0부터 파일 브라우저에 미리보기 창과 디렉터리 트리 보기를 제공합니다.
 
 | 항목 | 내용 |
 |------|------|
-| 버전 | 0.2.0 |
+| 버전 | 0.3.0 |
 | 언어 / 에디션 | Rust 2024, **최소 rustc 1.88** (`Cargo.toml`의 `rust-version`) |
 | 라이선스 | MIT |
 | 바이너리 이름 | `mdview` |
@@ -91,6 +92,17 @@ mdview는 [glow](https://github.com/charmbracelet/glow)와 같은 터미널 마�
   파이프·리다이렉션이면 이 모드가 자동으로 쓰이고 색도 제거된다
 - `-p, --pager`: 페이저를 명시적으로 요청(기본값이라 사실상 호환용)
 - 인자 없이 실행: 현재 디렉터리의 마크다운 파일 브라우저 (`.gitignore`·숨김 파일 제외, 6단계 깊이)
+
+### 파일 브라우저
+- 목록: 디렉터리 트리가 기본. `v`로 경로를 한 줄씩 나열하는 평면 보기와 오간다.
+  트리는 각 단계에서 디렉터리를 먼저, 그다음 파일을 이름순으로 놓고, 디렉터리 옆에 하위 파일 수를 적는다.
+  `h`/`l`(또는 `Enter`)로 접고 펴며, 접힘 상태는 세션 동안 유지된다.
+  필터를 걸면 결과가 숨지 않도록 접힌 곳도 모두 펼쳐 보여 준다.
+- 이동: vi 키. `j`/`k`, `Ctrl-d`/`Ctrl-u`(반 페이지), `Ctrl-f`/`Ctrl-b`(한 페이지), `gg`/`G`.
+  `gg`는 `g`를 두 번 눌러야 하고, 다른 키가 들어오면 대기가 풀린다. 페이지 크기는 마지막에 그린 목록 높이를 쓴다.
+- 미리보기: `p`로 켜고 끈다(기본 켬). 오른쪽 창에 선택한 문서를 **실제 렌더러로** 그리므로
+  수식·표·다이어그램까지 그대로 보인다. 같은 (경로, 폭)이면 다시 렌더링하지 않고 캐시를 쓴다.
+  창 폭이 76칸 미만이면 자동으로 접고, 1MB가 넘는 파일과 원격 URL은 열기 전까지 렌더링하지 않는다.
 - 테마: `-s auto|dark|light|notty`. auto는 TTY면 dark, `COLORFGBG`로 밝은 배경 감지.
   `-s`를 안 주면 `MDVIEW_STYLE` 환경변수를 본다(macOS 터미널은 `COLORFGBG`를 안 내보내므로 여기서 지정).
   `--no-color`와 `NO_COLOR` 지원
@@ -149,7 +161,8 @@ src/
   output/ansi.rs     Line → ANSI 문자열
   output/tui_convert.rs  Line → ratatui 텍스트
   output/pager.rs    페이저 TUI
-  output/picker.rs   파일 브라우저 TUI (Local / Stashed 탭)
+  output/picker.rs   파일 브라우저 TUI (Local / Stashed 탭, 트리·평면 보기, 미리보기 창)
+  output/tree.rs     파일 목록 → 계층 행 펼치기 (순수 함수, 접힘 처리)
 packaging/
   arch/PKGBUILD          Arch Linux 패키지
   debian/build-deb.sh    Debian/Ubuntu .deb 빌드 스크립트
@@ -182,6 +195,11 @@ docs/superpowers/specs/  최초 설계 문서
    - macOS 자소 분리 한글을 읽을 때 합치도록 `hangul.rs` 추가
    - 색 구성을 무채색 + 푸른 계열 강조로 정리(코드 강조와 TUI 크롬 포함)
    - 터미널 출력이면 페이저를 기본으로 열고, 기존 직접 출력은 `-P/--print`로 이동
+11. 파일 브라우저 보강
+   - 오른쪽 미리보기 창(`p`). 목록 위젯은 평면 배열만 그리므로, 트리를 미리 행으로 펼쳐 두는
+     `output/tree.rs`를 순수 함수로 분리해 단위 테스트를 붙였다
+   - vi 이동 키(`j`/`k`, `Ctrl-d`/`u`/`f`/`b`, `gg`, `G`)
+   - 디렉터리 계층 보기와 접기·펴기, `v`로 평면 보기와 전환
 
 ## 5. 설치
 
@@ -195,7 +213,7 @@ docs/superpowers/specs/  최초 설계 문서
 zip을 풀고 저장소 루트에서 실행하면 배포판을 감지해 알맞은 방식으로 설치합니다.
 
 ```sh
-unzip mdview-0.2.0.zip && cd mdview
+unzip mdview-0.3.0.zip && cd mdview
 ./install.sh
 ```
 
@@ -217,7 +235,7 @@ sudo apt install build-essential curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.2.0_amd64.deb   # arm64 등 아키텍처에 따라 다름
+sudo apt install ./dist/mdview_0.3.0_amd64.deb   # arm64 등 아키텍처에 따라 다름
 ```
 
 ### macOS 또는 cargo만 사용
@@ -261,8 +279,14 @@ mdview stash -r a.md                  # 스태시 제거
 
 | 키 | 동작 |
 |----|------|
-| `j` / `k` | 이동 |
-| `Enter` | 열기 |
+| `j` / `k`, 방향키 | 한 줄 이동 |
+| `Ctrl-d` / `Ctrl-u` | 반 페이지 |
+| `Ctrl-f` / `Ctrl-b`, `PgDn` / `PgUp` | 한 페이지 |
+| `gg` / `G`, `Home` / `End` | 처음 / 끝 |
+| `Enter` | 파일이면 열기, 디렉터리면 접기·펴기 |
+| `h` / `l`, `←` / `→` | 디렉터리 접기 / 펴기 (파일 위 `h`는 상위로) |
+| `v` | 트리 ↔ 평면 보기 |
+| `p` | 미리보기 켜기 / 끄기 |
 | `/` | 이름 필터 |
 | `Tab`, `1` / `2` | Local ↔ Stashed 탭 |
 | `s` | (Local) 스태시 저장 |
@@ -278,12 +302,13 @@ mdview stash -r a.md                  # 스태시 제거
 - PKGBUILD: macOS에서 prepare/build/check/package 단계를 직접 실행해 산출물 확인
 - .deb: `dpkg-deb --info/--contents`로 제어 파일과 파일 배치(root 소유) 확인, 추출한 바이너리 실행 확인
 
-### 0.2.0 (Arch Linux에서 검증)
-- 테스트 148개 통과, `cargo clippy --all-targets` 경고 없음
+### 0.2.0 / 0.3.0 (Arch Linux에서 검증)
+- 테스트 166개 통과, `cargo clippy --all-targets` 경고 없음
 - 통합 테스트: 예제 문서 전체를 폭 40~400으로 렌더링해 줄 넘침이 없는지 확인,
   잘린 mermaid·LaTeX 입력 40여 가지에 패닉이 없는지 확인
 - pty(가상 터미널)로 실제 화면을 재구성해 확인: 페이저가 기본으로 열리는지,
-  파일 브라우저 Local·Stashed 목록에 자소 분리가 남지 않는지
+  파일 브라우저 Local·Stashed 목록에 자소 분리가 남지 않는지,
+  브라우저의 트리 보기·미리보기·vi 이동 키(`gg`는 두 번 눌러야 동작)가 실제로 먹는지
 - `makepkg -sif`로 Arch 패키지를 빌드해 `/usr/bin/mdview`에 설치, 설치본으로 기능 재확인
   (빌드 중 `cargo test --frozen --release`가 함께 돈다)
 

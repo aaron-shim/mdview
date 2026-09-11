@@ -240,7 +240,7 @@ fn browse(cli: &Cli, theme: Theme, root: PathBuf, stash: Rc<RefCell<Stash>>) -> 
     }
     let root = root.canonicalize().unwrap_or(root);
     let files = source::find_markdown_files(&root);
-    let mut picker = Picker::new(root, files, stash.clone());
+    let mut picker = Picker::new(root, files, stash.clone(), theme.clone());
     // 페이저와 브라우저를 오갈 때 터미널을 한 번만 초기화한다.
     let mut terminal = init_terminal();
     let result = browse_loop(cli, &theme, &mut picker, stash, &mut terminal);

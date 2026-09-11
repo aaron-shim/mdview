@@ -1,15 +1,22 @@
 //! 마크다운 파일 브라우저 TUI: Local 탭(현재 디렉터리)과 Stashed 탭(즐겨찾기).
+//!
+//! 목록은 평면/트리 두 가지로 볼 수 있고(`v`), 오른쪽에 미리보기 창을 붙일 수
+//! 있다(`p`). 이동은 vi 키(j/k, Ctrl-d/u/f/b, gg, G)를 따른다.
 
+use crate::output::tree::{self, Row};
+use crate::output::tui_convert;
 use crate::source::Source;
 use crate::stash::Stash;
+use crate::theme::Theme;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -20,6 +27,15 @@ pub enum Tab {
     Stashed,
 }
 
+/// 목록 표시 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// 경로를 한 줄씩 나열
+    Flat,
+    /// 디렉터리 아래에 파일을 계층으로
+    Tree,
+}
+
 enum Mode {
     Normal,
     Filter,
@@ -27,16 +43,32 @@ enum Mode {
     Note(usize, String),
 }
 
+/// 미리보기로 그려 둔 내용. 같은 (경로, 폭)이면 다시 렌더링하지 않는다.
+struct PreviewCache {
+    key: (String, usize),
+    lines: Vec<Line<'static>>,
+}
+
 pub struct Picker {
     root: PathBuf,
     files: Vec<PathBuf>,
     stash: Rc<RefCell<Stash>>,
+    theme: Theme,
     tab: Tab,
-    filtered: Vec<usize>,
+    view: View,
+    rows: Vec<Row>,
     state: ListState,
     filter: String,
     mode: Mode,
     status: Option<(String, Instant)>,
+    /// 접어 둔 디렉터리(트리 보기)
+    collapsed: HashSet<PathBuf>,
+    preview: bool,
+    cache: Option<PreviewCache>,
+    /// `gg` 입력 대기
+    pending_g: bool,
+    /// 마지막으로 그린 목록 높이(페이지 단위 이동에 쓴다)
+    page: usize,
 }
 
 pub enum PickerExit {
@@ -46,23 +78,37 @@ pub enum PickerExit {
 }
 
 const STATUS_TTL: Duration = Duration::from_secs(2);
+/// 미리보기를 붙이기 위한 최소 가로 폭
+const MIN_WIDTH_FOR_PREVIEW: u16 = 76;
+/// 미리보기로 읽을 최대 파일 크기
+const MAX_PREVIEW_BYTES: u64 = 1 << 20;
 
 impl Picker {
-    pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>) -> Self {
+    pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>, theme: Theme) -> Self {
         let mut p = Picker {
             root,
             files,
             stash,
+            theme,
             tab: Tab::Local,
-            filtered: Vec::new(),
+            view: View::Tree,
+            rows: Vec::new(),
             state: ListState::default(),
             filter: String::new(),
             mode: Mode::Normal,
             status: None,
+            collapsed: HashSet::new(),
+            preview: true,
+            cache: None,
+            pending_g: false,
+            page: 10,
         };
-        p.apply_filter();
+        p.rebuild();
+        p.select_first_item();
         p
     }
+
+    // ------------------------------------------------------------ 목록 구성
 
     fn item_count(&self) -> usize {
         match self.tab {
@@ -82,14 +128,31 @@ impl Picker {
         }
     }
 
-    fn apply_filter(&mut self) {
+    /// 필터·보기 방식·접힘 상태를 반영해 행을 다시 만든다.
+    fn rebuild(&mut self) {
         let q = self.filter.to_lowercase();
-        self.filtered = (0..self.item_count()).filter(|&i| q.is_empty() || self.item_text(i).to_lowercase().contains(&q)).collect();
-        if self.filtered.is_empty() {
+        let keep: Vec<usize> = (0..self.item_count()).filter(|&i| q.is_empty() || self.item_text(i).to_lowercase().contains(&q)).collect();
+        self.rows = match self.tab {
+            Tab::Local if self.view == View::Tree => {
+                let entries: Vec<(usize, PathBuf)> = keep.iter().map(|&i| (i, self.files[i].clone())).collect();
+                // 필터 중에는 결과가 숨지 않도록 모두 펼친다.
+                let collapsed = if q.is_empty() { self.collapsed.clone() } else { HashSet::new() };
+                tree::rows(&entries, &collapsed)
+            }
+            _ => tree::flat_rows(&keep.iter().map(|&i| (i, PathBuf::new())).collect::<Vec<_>>()),
+        };
+        if self.rows.is_empty() {
             self.state.select(None);
         } else {
-            let sel = self.state.selected().unwrap_or(0).min(self.filtered.len() - 1);
+            let sel = self.state.selected().unwrap_or(0).min(self.rows.len() - 1);
             self.state.select(Some(sel));
+        }
+    }
+
+    /// 첫 번째 "파일" 행으로 커서를 옮긴다(트리 첫 줄은 디렉터리일 수 있다).
+    fn select_first_item(&mut self) {
+        if let Some(i) = self.rows.iter().position(|r| r.item_index().is_some()) {
+            self.state.select(Some(i));
         }
     }
 
@@ -98,31 +161,121 @@ impl Picker {
             self.tab = tab;
             self.filter.clear();
             self.state.select(Some(0));
-            self.apply_filter();
+            self.rebuild();
+            self.select_first_item();
         }
     }
 
+    fn toggle_view(&mut self) {
+        if self.tab != Tab::Local {
+            self.set_status("트리 보기는 Local 탭에서만 쓸 수 있습니다");
+            return;
+        }
+        // 보고 있던 파일을 그대로 따라가도록 기억해 둔다.
+        let current = self.selected_item();
+        self.view = if self.view == View::Tree { View::Flat } else { View::Tree };
+        self.rebuild();
+        match current.and_then(|i| self.rows.iter().position(|r| r.item_index() == Some(i))) {
+            Some(pos) => self.state.select(Some(pos)),
+            None => self.select_first_item(),
+        }
+        self.set_status(if self.view == View::Tree { "트리 보기" } else { "평면 보기" });
+    }
+
+    // ------------------------------------------------------------ 이동
+
     fn move_sel(&mut self, delta: isize) {
-        if self.filtered.is_empty() {
+        if self.rows.is_empty() {
             return;
         }
         let cur = self.state.selected().unwrap_or(0) as isize;
-        let n = self.filtered.len() as isize;
-        let next = (cur + delta).clamp(0, n - 1);
-        self.state.select(Some(next as usize));
+        let n = self.rows.len() as isize;
+        self.state.select(Some((cur + delta).clamp(0, n - 1) as usize));
     }
 
-    /// 현재 선택된 항목의 원본 인덱스
-    fn selected_index(&self) -> Option<usize> {
-        self.state.selected().and_then(|s| self.filtered.get(s).copied())
+    fn goto(&mut self, pos: Pos) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        self.state.select(Some(match pos {
+            Pos::First => 0,
+            Pos::Last => last,
+        }));
+    }
+
+    // ------------------------------------------------------------ 선택 항목
+
+    /// 선택된 행이 파일이면 원본 인덱스.
+    fn selected_item(&self) -> Option<usize> {
+        self.state.selected().and_then(|s| self.rows.get(s)).and_then(Row::item_index)
+    }
+
+    /// 선택된 행이 디렉터리이면 그 경로.
+    fn selected_dir(&self) -> Option<PathBuf> {
+        match self.state.selected().and_then(|s| self.rows.get(s)) {
+            Some(Row::Dir { path, .. }) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// 선택된 파일의 실제 경로(미리보기·열기에 쓴다).
+    fn selected_path(&self) -> Option<Source> {
+        let i = self.selected_item()?;
+        Some(match self.tab {
+            Tab::Local => Source::File(self.root.join(&self.files[i])),
+            Tab::Stashed => Source::from_stash_key(&self.stash.borrow().entries[i].source),
+        })
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
     }
 
+    fn toggle_dir(&mut self) {
+        let Some(path) = self.selected_dir() else { return };
+        if !self.collapsed.remove(&path) {
+            self.collapsed.insert(path);
+        }
+        let sel = self.state.selected();
+        self.rebuild();
+        if let Some(s) = sel {
+            self.state.select(Some(s.min(self.rows.len().saturating_sub(1))));
+        }
+    }
+
+    /// 트리에서 접기(왼쪽). 파일 위에서는 부모 디렉터리로 올라간다.
+    fn collapse_or_parent(&mut self) {
+        if self.selected_dir().is_some() {
+            self.toggle_dir();
+            return;
+        }
+        let Some(sel) = self.state.selected() else { return };
+        let depth = self.rows[sel].depth();
+        if depth == 0 {
+            return;
+        }
+        if let Some(pos) = self.rows[..sel].iter().rposition(|r| matches!(r, Row::Dir { depth: d, .. } if *d < depth)) {
+            self.state.select(Some(pos));
+        }
+    }
+
+    fn expand(&mut self) {
+        if let Some(path) = self.selected_dir() {
+            if self.collapsed.remove(&path) {
+                let sel = self.state.selected();
+                self.rebuild();
+                if let Some(s) = sel {
+                    self.state.select(Some(s));
+                }
+            } else {
+                self.move_sel(1);
+            }
+        }
+    }
+
     fn stash_selected(&mut self) {
-        let Some(i) = self.selected_index() else { return };
+        let Some(i) = self.selected_item() else { return };
         let path = self.root.join(&self.files[i]);
         let Some(key) = Source::File(path).stash_key() else { return };
         let result = {
@@ -138,7 +291,7 @@ impl Picker {
     }
 
     fn remove_selected(&mut self) {
-        let Some(i) = self.selected_index() else { return };
+        let Some(i) = self.selected_item() else { return };
         let result = {
             let mut st = self.stash.borrow_mut();
             st.remove(i);
@@ -148,11 +301,11 @@ impl Picker {
             Ok(()) => self.set_status("Removed from stash"),
             Err(e) => self.set_status(format!("Save failed: {e:#}")),
         }
-        self.apply_filter();
+        self.rebuild();
     }
 
     fn open_selected(&self) -> Option<PickerExit> {
-        let i = self.selected_index()?;
+        let i = self.selected_item()?;
         Some(match self.tab {
             Tab::Local => {
                 let rel = &self.files[i];
@@ -166,9 +319,11 @@ impl Picker {
         })
     }
 
+    // ------------------------------------------------------------ 입력 처리
+
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<PickerExit> {
         // 페이저에서 돌아왔을 때 스태시가 바뀌었을 수 있다.
-        self.apply_filter();
+        self.rebuild();
         loop {
             terminal.draw(|f| self.draw(f))?;
             if !event::poll(Duration::from_millis(250))? {
@@ -185,16 +340,17 @@ impl Picker {
                         KeyCode::Esc => {
                             self.mode = Mode::Normal;
                             self.filter.clear();
-                            self.apply_filter();
+                            self.rebuild();
                         }
                         KeyCode::Enter => self.mode = Mode::Normal,
                         KeyCode::Backspace => {
                             self.filter.pop();
-                            self.apply_filter();
+                            self.rebuild();
                         }
                         KeyCode::Char(c) if !ctrl => {
                             self.filter.push(c);
-                            self.apply_filter();
+                            self.rebuild();
+                            self.select_first_item();
                         }
                         KeyCode::Down => self.move_sel(1),
                         KeyCode::Up => self.move_sel(-1),
@@ -228,8 +384,18 @@ impl Picker {
                 }
                 Mode::Normal => {}
             }
-            let page = terminal.size()?.height.saturating_sub(3) as isize;
+            // `gg`는 g를 두 번 눌러야 한다. 다른 키가 오면 대기를 푼다.
+            let was_pending_g = std::mem::take(&mut self.pending_g);
+            let half = (self.page / 2).max(1) as isize;
+            let full = self.page.max(1) as isize;
             match k.code {
+                KeyCode::Char('g') if !ctrl => {
+                    if was_pending_g {
+                        self.goto(Pos::First);
+                    } else {
+                        self.pending_g = true;
+                    }
+                }
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(PickerExit::Quit),
                 KeyCode::Char('c') if ctrl => return Ok(PickerExit::Quit),
                 KeyCode::Tab | KeyCode::BackTab => {
@@ -240,23 +406,34 @@ impl Picker {
                 KeyCode::Char('2') => self.switch_tab(Tab::Stashed),
                 KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
-                KeyCode::PageDown => self.move_sel(page),
-                KeyCode::PageUp => self.move_sel(-page),
-                KeyCode::Char('d') if ctrl => self.move_sel(page),
-                KeyCode::Char('u') if ctrl => self.move_sel(-page),
-                KeyCode::Char('g') | KeyCode::Home => self.move_sel(isize::MIN / 2),
-                KeyCode::Char('G') | KeyCode::End => self.move_sel(isize::MAX / 2),
+                KeyCode::Char('d') if ctrl => self.move_sel(half),
+                KeyCode::Char('u') if ctrl => self.move_sel(-half),
+                KeyCode::Char('f') if ctrl => self.move_sel(full),
+                KeyCode::Char('b') if ctrl => self.move_sel(-full),
+                KeyCode::PageDown => self.move_sel(full),
+                KeyCode::PageUp => self.move_sel(-full),
+                KeyCode::Char('G') | KeyCode::End => self.goto(Pos::Last),
+                KeyCode::Home => self.goto(Pos::First),
+                KeyCode::Char('v') => self.toggle_view(),
+                KeyCode::Char('p') => {
+                    self.preview = !self.preview;
+                    self.set_status(if self.preview { "미리보기 켬" } else { "미리보기 끔" });
+                }
+                KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
+                KeyCode::Char('l') | KeyCode::Right => self.expand(),
                 KeyCode::Char('/') => self.mode = Mode::Filter,
                 KeyCode::Char('s') if self.tab == Tab::Local => self.stash_selected(),
                 KeyCode::Char('x') if self.tab == Tab::Stashed => self.remove_selected(),
                 KeyCode::Char('m') if self.tab == Tab::Stashed => {
-                    if let Some(i) = self.selected_index() {
+                    if let Some(i) = self.selected_item() {
                         let cur = self.stash.borrow().entries[i].note.clone().unwrap_or_default();
                         self.mode = Mode::Note(i, cur);
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(exit) = self.open_selected() {
+                    if self.selected_dir().is_some() {
+                        self.toggle_dir();
+                    } else if let Some(exit) = self.open_selected() {
                         return Ok(exit);
                     }
                 }
@@ -265,10 +442,31 @@ impl Picker {
         }
     }
 
+    // ------------------------------------------------------------ 그리기
+
     fn draw(&mut self, f: &mut Frame) {
         let [header, body, footer] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+        self.page = body.height as usize;
 
-        // 헤더: 앱 이름 + 탭
+        self.draw_header(f, header);
+
+        // 폭이 좁으면 미리보기를 접는다.
+        let show_preview = self.preview && body.width >= MIN_WIDTH_FOR_PREVIEW;
+        let (list_area, preview_area) = if show_preview {
+            let [l, r] = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
+            (l, Some(r))
+        } else {
+            (body, None)
+        };
+
+        self.draw_list(f, list_area);
+        if let Some(area) = preview_area {
+            self.draw_preview(f, area);
+        }
+        self.draw_footer(f, footer, show_preview);
+    }
+
+    fn draw_header(&self, f: &mut Frame, area: Rect) {
         let tab_style = |active: bool| {
             if active {
                 Style::default().fg(Color::Indexed(110)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -277,85 +475,310 @@ impl Picker {
             }
         };
         let n_stash = self.stash.borrow().entries.len();
+        let where_ = if self.tab == Tab::Local {
+            crate::hangul::compose(&crate::stash::shorten_home(&self.root.to_string_lossy()))
+        } else {
+            String::new()
+        };
         let title = Line::from(vec![
             Span::styled(" mdview ", Style::default().fg(Color::Indexed(231)).bg(Color::Indexed(24)).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled("Local", tab_style(self.tab == Tab::Local)),
             Span::raw("   "),
             Span::styled(format!("Stashed ({n_stash})"), tab_style(self.tab == Tab::Stashed)),
-            Span::styled(
-                format!("   {}", if self.tab == Tab::Local { crate::hangul::compose(&crate::stash::shorten_home(&self.root.to_string_lossy())) } else { String::new() }),
-                Style::default().fg(Color::Indexed(245)),
-            ),
+            Span::styled(format!("   {where_}"), Style::default().fg(Color::Indexed(245))),
         ]);
-        f.render_widget(Paragraph::new(title), header);
+        f.render_widget(Paragraph::new(title), area);
+    }
 
-        // 목록
+    fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         let dim = Style::default().fg(Color::Indexed(245));
         let name_style = Style::default().fg(Color::Indexed(252));
-        let items: Vec<ListItem> = match self.tab {
-            Tab::Local => self
-                .filtered
-                .iter()
-                .map(|&i| {
-                    let p = &self.files[i];
-                    // macOS의 나뉜 자소를 화면에 나올 때만 합친다.
-                    let name = p.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
-                    let dir = p.parent().map(|d| crate::hangul::compose(&d.to_string_lossy())).unwrap_or_default();
-                    let mut spans = vec![Span::raw("  "), Span::styled(name, name_style)];
-                    if !dir.is_empty() && dir != "." {
-                        spans.push(Span::styled(format!("  {dir}/"), dim));
-                    }
-                    ListItem::new(Line::from(spans))
-                })
-                .collect(),
-            Tab::Stashed => {
-                let st = self.stash.borrow();
-                self.filtered
-                    .iter()
-                    .map(|&i| {
-                        let e = &st.entries[i];
-                        let mut spans = vec![Span::raw("  "), Span::styled(e.display_name(), name_style)];
-                        let dir = e.display_dir();
-                        if !dir.is_empty() {
-                            spans.push(Span::styled(format!("  {dir}/"), dim));
-                        }
-                        if let Some(n) = &e.note {
-                            spans.push(Span::styled(format!("  — {n}"), Style::default().fg(Color::Indexed(66))));
-                        }
-                        ListItem::new(Line::from(spans))
-                    })
-                    .collect()
-            }
-        };
+        let dir_style = Style::default().fg(Color::Indexed(110));
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Dir { path, depth, open, files } => {
+                    let name = path.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
+                    let mark = if *open { "▾ " } else { "▸ " };
+                    Line::from(vec![
+                        Span::raw("  ".repeat(*depth)),
+                        Span::styled(format!("{mark}{name}/"), dir_style),
+                        Span::styled(format!("  {files}"), dim),
+                    ])
+                }
+                Row::Item { idx, depth } => self.item_line(*idx, *depth, name_style, dim),
+            })
+            .map(ListItem::new)
+            .collect();
         let list = List::new(items)
             .highlight_style(Style::default().fg(Color::Indexed(110)).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌ ");
-        f.render_stateful_widget(list, body, &mut self.state);
+        f.render_stateful_widget(list, area, &mut self.state);
+    }
 
-        // 푸터
+    fn item_line(&self, idx: usize, depth: usize, name_style: Style, dim: Style) -> Line<'static> {
+        match self.tab {
+            Tab::Local => {
+                let p = &self.files[idx];
+                let name = p.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
+                let mut spans = vec![Span::raw("  ".repeat(depth)), Span::styled(name, name_style)];
+                // 평면 보기에서는 어느 디렉터리인지 뒤에 덧붙인다.
+                if self.view == View::Flat {
+                    let dir = p.parent().map(|d| crate::hangul::compose(&d.to_string_lossy())).unwrap_or_default();
+                    if !dir.is_empty() && dir != "." {
+                        spans.push(Span::styled(format!("  {dir}/"), dim));
+                    }
+                }
+                Line::from(spans)
+            }
+            Tab::Stashed => {
+                let st = self.stash.borrow();
+                let e = &st.entries[idx];
+                let mut spans = vec![Span::styled(e.display_name(), name_style)];
+                let dir = e.display_dir();
+                if !dir.is_empty() {
+                    spans.push(Span::styled(format!("  {dir}/"), dim));
+                }
+                if let Some(n) = &e.note {
+                    spans.push(Span::styled(format!("  — {n}"), Style::default().fg(Color::Indexed(66))));
+                }
+                Line::from(spans)
+            }
+        }
+    }
+
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::new().borders(Borders::LEFT).border_style(Style::default().fg(Color::Indexed(240)));
+        let inner = block.inner(area).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
+        f.render_widget(block, area);
+        let lines = self.preview_lines(inner.width as usize);
+        let shown: Vec<Line<'static>> = lines.iter().take(inner.height as usize).cloned().collect();
+        f.render_widget(Paragraph::new(shown), inner);
+    }
+
+    /// 선택된 항목의 미리보기 줄. 같은 (경로, 폭)이면 캐시를 쓴다.
+    fn preview_lines(&mut self, width: usize) -> &[Line<'static>] {
+        let dim = Style::default().fg(Color::Indexed(245));
+        let key = match self.selected_path() {
+            Some(Source::File(p)) => (p.to_string_lossy().into_owned(), width),
+            Some(Source::Url(u)) => (u, width),
+            _ => match self.selected_dir() {
+                Some(d) => (format!("<dir>{}", d.display()), width),
+                None => (String::from("<none>"), width),
+            },
+        };
+        if self.cache.as_ref().is_none_or(|c| c.key != key) {
+            let lines = self.render_preview(&key.0, width, dim);
+            self.cache = Some(PreviewCache { key, lines });
+        }
+        &self.cache.as_ref().unwrap().lines
+    }
+
+    fn render_preview(&self, key: &str, width: usize, dim: Style) -> Vec<Line<'static>> {
+        let note = |s: &str| vec![Line::from(Span::styled(s.to_string(), dim))];
+        if width < 8 {
+            return Vec::new();
+        }
+        if let Some(d) = key.strip_prefix("<dir>") {
+            let n = self.rows.iter().filter(|r| matches!(r, Row::Dir { path, .. } if path == &PathBuf::from(d))).count();
+            let _ = n;
+            return note(&format!("{d}/  — 디렉터리 (Enter 또는 h/l 로 접고 펴기)"));
+        }
+        if key == "<none>" {
+            return note("선택된 항목이 없습니다");
+        }
+        if crate::source::is_url(key) {
+            return note("원격 문서입니다. Enter 로 열면 내려받습니다.");
+        }
+        let path = PathBuf::from(key);
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() > MAX_PREVIEW_BYTES => {
+                return note(&format!("파일이 큽니다 ({} KB). Enter 로 열어 보세요.", m.len() / 1024));
+            }
+            Err(e) => return note(&format!("읽을 수 없습니다: {e}")),
+            _ => {}
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            return note("읽을 수 없습니다");
+        };
+        let text = crate::hangul::compose(&String::from_utf8_lossy(&bytes));
+        let mut out: Vec<Line<'static>> = crate::render::render(&text, &self.theme, width).iter().map(tui_convert::line).collect();
+        if out.is_empty() {
+            out = note("(빈 문서)");
+        }
+        out
+    }
+
+    fn draw_footer(&mut self, f: &mut Frame, area: Rect, show_preview: bool) {
+        let dim = Style::default().fg(Color::Indexed(245));
         if self.status.as_ref().is_some_and(|(_, t)| t.elapsed() > STATUS_TTL) {
             self.status = None;
         }
-        let footer_text = match &self.mode {
+        let files = self.rows.iter().filter(|r| r.item_index().is_some()).count();
+        let text = match &self.mode {
             Mode::Filter => format!("/{}", self.filter),
-            Mode::Note(_, text) => format!("note: {text}▏  (Enter save, Esc cancel)"),
+            Mode::Note(_, t) => format!("note: {t}▏  (Enter save, Esc cancel)"),
             Mode::Normal => {
                 if let Some((msg, _)) = &self.status {
                     msg.clone()
-                } else if self.filtered.is_empty() {
+                } else if files == 0 {
                     match self.tab {
                         Tab::Local => "no markdown files found  Tab stashed  q quit".to_string(),
                         Tab::Stashed => "stash is empty — press s on a file, or: mdview stash FILE|URL  Tab local  q quit".to_string(),
                     }
                 } else {
+                    let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{} files  j/k move  Enter open  s stash  / filter  Tab stashed  q quit", self.filtered.len()),
-                        Tab::Stashed => format!("{} stashed  j/k move  Enter open  x remove  m note  / filter  Tab local  q quit", self.filtered.len()),
+                        Tab::Local => format!("{files} files  j/k gg/G ^d^u^f^b  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Stashed => format!("{files} stashed  j/k gg/G  Enter open  x remove  m note  p preview  / filter  Tab local  q quit{hint}"),
                     }
                 }
             }
         };
-        f.render_widget(Paragraph::new(Span::styled(format!(" {footer_text}"), dim)), footer);
+        f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), area);
+    }
+}
+
+enum Pos {
+    First,
+    Last,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn picker(files: &[&str]) -> Picker {
+        let stash = Stash::load_from(std::env::temp_dir().join(format!("mdview-picker-{}.json", std::process::id())));
+        Picker::new(
+            PathBuf::from("/tmp/root"),
+            files.iter().map(PathBuf::from).collect(),
+            Rc::new(RefCell::new(stash)),
+            Theme::notty(),
+        )
+    }
+
+    /// 선택된 행을 사람이 읽을 수 있는 형태로.
+    fn at(p: &Picker) -> String {
+        match p.state.selected().and_then(|s| p.rows.get(s)) {
+            Some(Row::Dir { path, open, .. }) => format!("{}/{}", path.display(), if *open { "" } else { "(접힘)" }),
+            Some(Row::Item { idx, .. }) => p.files[*idx].display().to_string(),
+            None => "(없음)".into(),
+        }
+    }
+
+    #[test]
+    fn tree_is_the_default_view_and_starts_on_a_file() {
+        let p = picker(&["README.md", "docs/a.md", "docs/sub/b.md"]);
+        assert_eq!(p.view, View::Tree);
+        // 첫 행은 docs/ 디렉터리이지만 커서는 첫 파일에 놓인다.
+        assert!(matches!(p.rows[0], Row::Dir { .. }));
+        assert_eq!(at(&p), "docs/sub/b.md");
+    }
+
+    #[test]
+    fn motions_clamp_at_both_ends() {
+        let mut p = picker(&["a.md", "b.md", "c.md"]);
+        p.goto(Pos::First);
+        p.move_sel(-50);
+        assert_eq!(at(&p), "a.md", "위로 넘쳐도 첫 행에 멈춘다");
+        p.move_sel(50);
+        assert_eq!(at(&p), "c.md", "아래로 넘쳐도 마지막 행에 멈춘다");
+        p.goto(Pos::Last);
+        assert_eq!(at(&p), "c.md");
+        p.goto(Pos::First);
+        assert_eq!(at(&p), "a.md");
+    }
+
+    #[test]
+    fn motions_on_empty_list_do_not_panic() {
+        let mut p = picker(&[]);
+        p.move_sel(1);
+        p.move_sel(-1);
+        p.goto(Pos::First);
+        p.goto(Pos::Last);
+        assert_eq!(at(&p), "(없음)");
+    }
+
+    #[test]
+    fn toggling_view_keeps_the_selected_file() {
+        let mut p = picker(&["README.md", "docs/a.md", "docs/sub/b.md"]);
+        p.goto(Pos::Last);
+        let before = at(&p);
+        p.toggle_view();
+        assert_eq!(p.view, View::Flat);
+        assert_eq!(at(&p), before, "평면으로 바꿔도 같은 파일을 가리킨다");
+        p.toggle_view();
+        assert_eq!(p.view, View::Tree);
+        assert_eq!(at(&p), before, "트리로 돌아와도 마찬가지");
+    }
+
+    #[test]
+    fn flat_view_has_no_directory_rows() {
+        let mut p = picker(&["README.md", "docs/a.md"]);
+        p.toggle_view();
+        assert!(p.rows.iter().all(|r| r.item_index().is_some()));
+        assert_eq!(p.rows.len(), 2);
+    }
+
+    #[test]
+    fn collapsing_a_directory_hides_its_files() {
+        let mut p = picker(&["README.md", "docs/a.md", "docs/sub/b.md"]);
+        p.goto(Pos::First);
+        assert_eq!(at(&p), "docs/");
+        p.toggle_dir();
+        assert_eq!(at(&p), "docs/(접힘)");
+        assert_eq!(p.rows.len(), 2, "docs/ 와 README.md 만 남는다");
+        p.toggle_dir();
+        assert!(p.rows.len() > 2);
+    }
+
+    #[test]
+    fn filter_reveals_matches_inside_collapsed_directories() {
+        let mut p = picker(&["README.md", "docs/guide.md"]);
+        p.goto(Pos::First);
+        p.toggle_dir();
+        assert_eq!(p.rows.len(), 2);
+        p.filter = "guide".into();
+        p.rebuild();
+        assert!(p.rows.iter().any(|r| r.item_index() == Some(1)), "접혀 있어도 필터 결과는 보인다");
+    }
+
+    #[test]
+    fn h_on_a_file_jumps_to_its_parent_directory() {
+        let mut p = picker(&["docs/sub/b.md"]);
+        assert_eq!(at(&p), "docs/sub/b.md");
+        p.collapse_or_parent();
+        assert_eq!(at(&p), "docs/sub/");
+    }
+
+    #[test]
+    fn preview_of_a_missing_file_reports_the_error() {
+        let p = picker(&["gone.md"]);
+        let lines = p.render_preview("/tmp/definitely-not-here.md", 40, Style::default());
+        assert!(lines[0].spans[0].content.contains("읽을 수 없습니다"));
+    }
+
+    #[test]
+    fn preview_of_a_url_does_not_fetch() {
+        let p = picker(&[]);
+        let lines = p.render_preview("https://example.com/a.md", 40, Style::default());
+        assert!(lines[0].spans[0].content.contains("Enter"));
+    }
+
+    #[test]
+    fn preview_renders_markdown_headings() {
+        let dir = std::env::temp_dir().join(format!("mdview-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.md");
+        std::fs::write(&file, "# 제목\n\n본문\n").unwrap();
+        let p = picker(&["x.md"]);
+        let lines = p.render_preview(&file.to_string_lossy(), 30, Style::default());
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(text.iter().any(|l| l.contains("제목")));
+        assert!(text.iter().any(|l| l.contains('━')), "제목 밑줄까지 그려진다");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
