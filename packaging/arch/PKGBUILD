@@ -1,0 +1,58 @@
+# Maintainer: aaron-shim <noreply@example.com>
+#
+# 저장소 안의 소스로 빌드하는 PKGBUILD입니다.
+#   cd packaging/arch && makepkg -si
+# 원격 저장소에 올린 뒤에는 source=() 를 git+URL 이나 릴리스 tarball 로 바꾸면 됩니다.
+
+pkgname=mdview
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Terminal markdown viewer like glow, written in Rust (LaTeX math, mermaid diagrams, merged HTML tables, pager, file browser, stash, remote URLs)"
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+# /etc/makepkg.conf 의 전역 LTO(-flto)가 ring 의 C/어셈블리 오브젝트와
+# 충돌해 ld.lld 가 ring_core_* 심볼을 못 찾는 문제가 있어 LTO 를 끈다.
+# (https://github.com/briansmith/ring/issues/2746 참고)
+options=('!lto')
+# 소스는 이 PKGBUILD 가 있는 디렉터리의 상위 2단계(저장소 루트)에서 가져온다.
+source=()
+sha256sums=()
+
+_repo_root() {
+  cd "$startdir/../.." && pwd
+}
+
+prepare() {
+  local root
+  root="$(_repo_root)"
+  rm -rf "$srcdir/$pkgname"
+  mkdir -p "$srcdir/$pkgname"
+  # examples/ 는 통합 테스트가 include_str! 로 읽으므로 check() 를 위해 함께 복사한다.
+  cp -r "$root/Cargo.toml" "$root/Cargo.lock" "$root/src" "$root/examples" "$root/README.md" "$root/LICENSE" "$srcdir/$pkgname/"
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

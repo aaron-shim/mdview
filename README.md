@@ -1,0 +1,242 @@
+# mdview
+
+[glow](https://github.com/charmbracelet/glow)와 같은 터미널 마크다운 뷰어. Rust로 작성되었습니다.
+
+## 설치
+
+배포판 자동 감지 스크립트(Arch → makepkg, Debian/Ubuntu → .deb, 그 외 → cargo install):
+
+```sh
+./install.sh
+```
+
+또는 직접:
+
+```sh
+cargo install --path .
+```
+
+전체 정리 문서는 [docs/mdview-guide.md](docs/mdview-guide.md)를 참고하세요.
+
+### Arch Linux
+
+```sh
+sudo pacman -S --needed base-devel rust
+cd packaging/arch && makepkg -si
+```
+
+`packaging/arch/PKGBUILD`는 저장소 안의 소스로 빌드합니다. 빌드에 필요한 시스템 라이브러리는 없고,
+HTTPS는 rustls와 내장 인증서를 사용합니다.
+
+### Ubuntu / Debian
+
+**Rust 1.88 이상**이 필요합니다(let-chains 사용). Ubuntu 24.04의 apt `rustc`는 1.75, 25.04도 1.8x라
+어느 쪽도 부족하므로 rustup으로 설치하세요.
+
+```sh
+sudo apt install build-essential curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # 새 셸 열거나 source ~/.cargo/env
+```
+
+방법 1: 바로 설치
+
+```sh
+cargo install --path .
+```
+
+방법 2: `.deb` 패키지로 설치 (추가 도구 불필요, `dpkg-deb`만 사용)
+
+```sh
+./packaging/debian/build-deb.sh
+sudo apt install ./dist/mdview_0.2.0_amd64.deb   # 아키텍처에 따라 arm64 등
+```
+
+`.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
+Maintainer 필드는 기본값이 자리표시자이므로, 배포용으로 만들 때는
+`DEB_MAINTAINER="이름 <메일>" ./packaging/debian/build-deb.sh` 처럼 넘기세요.
+
+## 사용법
+
+```sh
+mdview README.md            # 페이저로 열기 (터미널이면 기본)
+mdview -P README.md         # 페이저 없이 그대로 출력
+cat README.md | mdview      # 표준입력에서 읽기 (파이프면 자동으로 그대로 출력)
+mdview                      # 현재 디렉터리의 마크다운 파일 브라우저
+mdview docs/                # 특정 디렉터리 브라우저
+mdview github.com/charmbracelet/glow          # GitHub 저장소 README
+mdview https://github.com/o/r/blob/main/a.md  # GitHub 파일 (raw로 자동 변환)
+mdview https://example.com/doc.md             # 임의 URL
+mdview stash a.md -n "메모"  # 스태시(즐겨찾기)에 저장
+mdview stash                # 스태시 목록
+mdview stash -r a.md        # 스태시에서 제거
+mdview -s light -w 80 a.md  # 밝은 테마, 폭 80
+mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
+```
+
+출력이 터미널이면 페이저로 열고, 파이프·리다이렉션이면 자동으로 그대로 출력합니다.
+
+### 옵션
+
+| 옵션 | 설명 |
+|------|------|
+| `-p, --pager` | 페이저로 열기 (터미널 출력이면 기본값) |
+| `-P, --print` (`--no-pager`) | 페이저 없이 stdout으로 바로 출력 |
+| `-s, --style <auto\|dark\|light\|notty>` | 색 테마 (기본 auto: TTY면 dark, `COLORFGBG`로 밝은 배경 감지) |
+| `-w, --width <N>` | 줄바꿈 폭 (기본: 터미널 폭, 최대 120) |
+| `--no-color` | 색 비활성화 (`NO_COLOR` 환경변수도 지원) |
+
+환경변수: `MDVIEW_STYLE=dark|light|notty|auto` (`-s`를 안 줬을 때의 기본 테마),
+`NO_COLOR`, `MDVIEW_STASH`(스태시 파일 위치). macOS 터미널은 배경색을 알려주지 않으므로,
+밝은 배경을 쓴다면 `export MDVIEW_STYLE=light`를 셸 설정에 넣어 두세요.
+
+### 페이저 키
+
+| 키 | 동작 |
+|----|------|
+| `j` / `k`, 방향키, 마우스 휠 | 한 줄 이동 |
+| `Space`, `PgDn` / `PgUp`, `Ctrl-f` / `Ctrl-b` | 한 화면 이동 |
+| `Ctrl-d` / `Ctrl-u` | 반 화면 이동 |
+| `g` / `G` | 처음 / 끝 |
+| `/` | 검색 (대소문자 무시), `n` / `N` 다음 / 이전, `Esc` 검색 해제 |
+| `s` | 현재 문서를 스태시에 저장 |
+| `Esc`, `Backspace` | 파일 브라우저로 돌아가기 (브라우저에서 연 경우) |
+| `q` | 종료 |
+
+### 파일 브라우저 키
+
+| 키 | 동작 |
+|----|------|
+| `j` / `k` | 이동 |
+| `Enter` | 열기 |
+| `/` | 이름 필터 |
+| `Tab`, `1` / `2` | Local ↔ Stashed 탭 전환 |
+| `s` | (Local 탭) 선택한 파일을 스태시에 저장 |
+| `x` | (Stashed 탭) 스태시에서 제거 |
+| `m` | (Stashed 탭) 메모 편집 |
+| `q` | 종료 |
+
+Local 탭은 `.gitignore`와 숨김 파일을 제외하고 하위 디렉터리까지 찾습니다.
+
+## 스태시 (로컬 즐겨찾기)
+
+glow의 스태시를 클라우드 없이 로컬 파일로 구현한 것입니다. 파일의 절대 경로 또는 URL과 메모를
+`~/.config/mdview/stash.json`에 저장하며 (`$XDG_CONFIG_HOME` 또는 `MDVIEW_STASH` 환경변수로 위치 변경 가능),
+어느 디렉터리에서 `mdview`를 실행하든 Stashed 탭에서 바로 열 수 있습니다. URL 항목은 열 때마다 다시 내려받습니다.
+
+## 원격 URL
+
+`http://`, `https://` URL과 `github.com/...` 형태를 지원합니다. `github.com/{owner}/{repo}`는 저장소의 README를,
+`github.com/{owner}/{repo}/blob/{ref}/{path}`는 해당 파일의 raw 내용을 가져옵니다. 요청 제한 시간은 15초입니다.
+
+## 지원하는 마크다운
+
+제목(H1~H6), 문단, 강조/굵게/취소선, 인라인 코드, 코드블록(syntect 구문 강조), 순서/비순서/중첩/체크박스 목록, 인용, 표(정렬·셀 줄바꿈), 링크, 이미지, 수평선, 각주, 강제 줄바꿈, YAML 프론트매터 생략. 한글·CJK 문자의 표시 폭을 고려해 줄바꿈합니다.
+
+제목은 `#` 기호를 그대로 두지 않고 렌더링합니다. H1은 아래에 굵은 줄(`━`), H2는 옅은 줄(`─`)을 제목 너비만큼
+긋고, H3 이하는 굵기와 색만 단계적으로 낮춥니다. 색이 없는 출력에서도 줄로 구조가 남습니다.
+
+```
+mdview 색 확인
+━━━━━━━━━━━━━━
+
+두 번째 제목
+────────────
+
+세 번째 제목
+```
+
+macOS에서 자소가 나뉜 채 저장된 한글(`한글`)은 화면에 나올 때 음절로 합칩니다. 파일 브라우저의
+Local·Stashed 목록(파일 이름·디렉터리·메모·이름 필터)과 페이저 제목, 문서 내용에 모두 적용됩니다.
+파일을 여는 데 쓰는 실제 경로와 스태시 키는 건드리지 않습니다.
+
+## 색 구성
+
+바탕은 무채색이고, 강조가 필요한 곳에만 차분한 푸른 계열을 씁니다.
+
+| 요소 | 색 |
+|------|-----|
+| 본문·인용·표 테두리·수평선 | 회색 계단 |
+| 제목·링크·인라인 코드·표 머리·다이어그램 테두리 | 은은한 파랑 |
+| 코드블록 구문 강조 | 밝기 차이는 그대로 두고 색만 무채색·푸른 쪽으로 눌러서 표시 |
+| 페이저·브라우저 UI(선택 항목, 검색 강조, 배지) | 같은 푸른 계열 |
+
+`-s light`는 밝은 배경용으로 같은 구성을 더 진한 파랑으로 씁니다. `--no-color`(또는 `NO_COLOR`)는 색을 모두 끕니다.
+
+## 수식 · 도표 · 다이어그램
+
+터미널에서 그대로 읽을 수 있게 그려 줍니다. 외부 프로그램이나 이미지 뷰어 없이 순수하게 문자로만 조판합니다.
+
+### 수식 (LaTeX)
+
+`$...$`(인라인)와 `$$...$$`(블록)을 유니코드로 조판합니다.
+
+```
+                         N_concurrency
+           Throughput = ───────────────    (Little's Law)
+                           T_latency
+
+                     ⎡w₁₁  w₁₂  ⋯  w₁ₙ⎤
+                     ⎢w₂₁  w₂₂  ⋯  w₂ₙ⎥    m×n
+                 W = ⎢ ⋮    ⋮   ⋱   ⋮ ⎥ ∈ ℝ
+                     ⎣wₘ₁  wₘ₂  ⋯  wₘₙ⎦
+```
+
+분수·근호·첨자·행렬·`cases`·`aligned`·큰 연산자(∑ ∏ ∫ lim)의 위아래 한계·강세(`\overline`, `\hat`)·
+그리스 문자·`\mathbb`/`\mathcal`/`\mathbf`·mhchem `\ce{}`를 다룹니다.
+블록이 터미널 폭을 넘으면 한 줄 표기(`a/b`)로 낮추고, 그래도 넘치면 줄을 접습니다.
+모르는 명령은 이름을 남겨 원문을 잃지 않습니다.
+
+### 도표
+
+마크다운 표에 더해 HTML `<table>`의 `rowspan`·`colspan` 병합과 셀 안 `<br>` 줄바꿈을 지원합니다.
+
+```
+┌──────┬──────────────────────┬────────┐
+│      │         구성         │        │
+│ 계층 ├──────────┬───────────┤  SLO   │
+│      │ 컴포넌트 │ 인스턴스  │        │
+├──────┼──────────┼───────────┼────────┤
+│      │ CDN      │ -         │ 99.99% │
+│ Edge ├──────────┼───────────┼────────┤
+│      │ ALB      │ 2         │ 99.95% │
+└──────┴──────────┴───────────┴────────┘
+```
+
+### Mermaid 다이어그램
+
+` ```mermaid ` 코드블록을 그림으로 그립니다.
+
+| 종류 | 그리는 방식 |
+|------|------|
+| `flowchart` / `graph` | 계층 배치(층 나누기 → 순서 정하기 → 배선). `subgraph` 테두리, 노드 모양, 점선·굵은 선, 간선 라벨 |
+| `sequenceDiagram` | 참가자 생명선, 화살표, `alt`/`opt`/`loop` 틀, `Note`, `autonumber` |
+| `stateDiagram` | 상태 전이, `[*]` 시작(●)·끝(◉), 합성 상태, `note` |
+| `erDiagram` | 엔터티 상자(속성 목록)와 카디널리티(`1`, `0..N` …) |
+| `classDiagram` | 이름·속성·메서드 칸, 상속(▽)·합성(◆)·집합(◇)·의존(점선) |
+| `gantt` | 날짜 축과 막대(▒ 완료 / ▓ 진행 / █ 예정 / ◆ 마일스톤), `after` 연결 |
+| `pie` | 가로 막대와 백분율 |
+| `gitGraph` | 브랜치 레인, 커밋(●), 병합(◆), 태그 |
+
+```
+      ┌─────────────┐
+      │ 개발 브랜치 │
+      │ feature/#NN │◀─┐
+      └─────────────┘  │
+             │ push    │
+             ▼         │
+        ╭════════╮     │
+        │ GitLab │     │
+        ╰════════╯     │
+```
+
+터미널은 세로로 길고 가로로 좁으므로, 그래프 계열은 `LR`/`TB` 지정과 무관하게 항상 위에서 아래로 배치합니다.
+라벨 폭을 줄여도 터미널 폭에 들어가지 않거나 지원하지 않는 종류(`mindmap`, `journey` 등)이면
+원문 코드블록을 그대로 보여줍니다.
+
+## 개발
+
+```sh
+cargo test
+cargo run -- examples/sample.md
+cargo run -- examples/markdown-sample.md   # 수식·도표·다이어그램 전체 확인
+```
