@@ -27,6 +27,13 @@ pub enum Tab {
     Stashed,
 }
 
+/// 키 입력을 받는 창.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    List,
+    Preview,
+}
+
 /// 목록 표시 방식.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -65,6 +72,16 @@ pub struct Picker {
     collapsed: HashSet<PathBuf>,
     preview: bool,
     cache: Option<PreviewCache>,
+    /// 지금 키를 받는 창
+    focus: Focus,
+    /// 미리보기 창의 스크롤 위치(줄 단위)
+    preview_scroll: usize,
+    /// 마지막으로 그릴 때 미리보기가 실제로 보였는지
+    preview_visible: bool,
+    /// 마지막으로 그린 미리보기 높이
+    preview_height: usize,
+    /// 지금 미리보기에 담긴 전체 줄 수
+    preview_len: usize,
     /// `gg` 입력 대기
     pending_g: bool,
     /// 마지막으로 그린 목록 높이(페이지 단위 이동에 쓴다)
@@ -100,6 +117,11 @@ impl Picker {
             collapsed: HashSet::new(),
             preview: true,
             cache: None,
+            focus: Focus::List,
+            preview_scroll: 0,
+            preview_visible: false,
+            preview_height: 10,
+            preview_len: 0,
             pending_g: false,
             page: 10,
         };
@@ -191,6 +213,33 @@ impl Picker {
         let cur = self.state.selected().unwrap_or(0) as isize;
         let n = self.rows.len() as isize;
         self.state.select(Some((cur + delta).clamp(0, n - 1) as usize));
+    }
+
+    /// 미리보기 창을 위아래로 움직인다. 페이저와 같은 방식으로 끝에서 멈춘다.
+    fn scroll_preview(&mut self, delta: isize) {
+        let max = self.preview_len.saturating_sub(self.preview_height);
+        let next = (self.preview_scroll as isize + delta).clamp(0, max as isize);
+        self.preview_scroll = next as usize;
+    }
+
+    fn scroll_preview_to(&mut self, pos: Pos) {
+        self.preview_scroll = match pos {
+            Pos::First => 0,
+            Pos::Last => self.preview_len.saturating_sub(self.preview_height),
+        };
+    }
+
+    /// 미리보기 창으로 들어간다. 꺼져 있으면 켜고 들어간다.
+    fn enter_preview(&mut self) {
+        if !self.preview {
+            self.preview = true;
+            self.preview_visible = true; // 다음 draw 에서 실제 폭을 보고 정해진다
+        }
+        if self.preview_visible {
+            self.focus = Focus::Preview;
+        } else {
+            self.set_status("창이 좁아 미리보기를 열 수 없습니다");
+        }
     }
 
     fn goto(&mut self, pos: Pos) {
@@ -388,50 +437,166 @@ impl Picker {
             let was_pending_g = std::mem::take(&mut self.pending_g);
             let half = (self.page / 2).max(1) as isize;
             let full = self.page.max(1) as isize;
+            // 미리보기 창에 들어가 있으면 같은 이동 키가 그쪽을 움직인다.
+            let in_preview = self.focus == Focus::Preview;
+            let (half_p, full_p) = ((self.preview_height / 2).max(1) as isize, self.preview_height.max(1) as isize);
             match k.code {
                 KeyCode::Char('g') if !ctrl => {
-                    if was_pending_g {
-                        self.goto(Pos::First);
-                    } else {
+                    if !was_pending_g {
                         self.pending_g = true;
+                    } else if in_preview {
+                        self.scroll_preview_to(Pos::First);
+                    } else {
+                        self.goto(Pos::First);
                     }
                 }
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(PickerExit::Quit),
+                KeyCode::Char('q') => return Ok(PickerExit::Quit),
                 KeyCode::Char('c') if ctrl => return Ok(PickerExit::Quit),
+                KeyCode::Esc => {
+                    if in_preview {
+                        self.focus = Focus::List;
+                    } else {
+                        return Ok(PickerExit::Quit);
+                    }
+                }
+                // 목록 쪽 동작을 부르는 키는 먼저 포커스를 목록으로 되돌린다.
                 KeyCode::Tab | KeyCode::BackTab => {
+                    self.focus = Focus::List;
                     let next = if self.tab == Tab::Local { Tab::Stashed } else { Tab::Local };
                     self.switch_tab(next);
                 }
-                KeyCode::Char('1') => self.switch_tab(Tab::Local),
-                KeyCode::Char('2') => self.switch_tab(Tab::Stashed),
-                KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
-                KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
-                KeyCode::Char('d') if ctrl => self.move_sel(half),
-                KeyCode::Char('u') if ctrl => self.move_sel(-half),
-                KeyCode::Char('f') if ctrl => self.move_sel(full),
-                KeyCode::Char('b') if ctrl => self.move_sel(-full),
-                KeyCode::PageDown => self.move_sel(full),
-                KeyCode::PageUp => self.move_sel(-full),
-                KeyCode::Char('G') | KeyCode::End => self.goto(Pos::Last),
-                KeyCode::Home => self.goto(Pos::First),
-                KeyCode::Char('v') => self.toggle_view(),
+                KeyCode::Char('1') => {
+                    self.focus = Focus::List;
+                    self.switch_tab(Tab::Local);
+                }
+                KeyCode::Char('2') => {
+                    self.focus = Focus::List;
+                    self.switch_tab(Tab::Stashed);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if in_preview {
+                        self.scroll_preview(1)
+                    } else {
+                        self.move_sel(1)
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if in_preview {
+                        self.scroll_preview(-1)
+                    } else {
+                        self.move_sel(-1)
+                    }
+                }
+                KeyCode::Char('d') if ctrl => {
+                    if in_preview {
+                        self.scroll_preview(half_p)
+                    } else {
+                        self.move_sel(half)
+                    }
+                }
+                KeyCode::Char('u') if ctrl => {
+                    if in_preview {
+                        self.scroll_preview(-half_p)
+                    } else {
+                        self.move_sel(-half)
+                    }
+                }
+                KeyCode::Char('f') if ctrl => {
+                    if in_preview {
+                        self.scroll_preview(full_p)
+                    } else {
+                        self.move_sel(full)
+                    }
+                }
+                KeyCode::Char('b') if ctrl => {
+                    if in_preview {
+                        self.scroll_preview(-full_p)
+                    } else {
+                        self.move_sel(-full)
+                    }
+                }
+                KeyCode::Char(' ') | KeyCode::PageDown => {
+                    if in_preview {
+                        self.scroll_preview(full_p)
+                    } else {
+                        self.move_sel(full)
+                    }
+                }
+                KeyCode::PageUp => {
+                    if in_preview {
+                        self.scroll_preview(-full_p)
+                    } else {
+                        self.move_sel(-full)
+                    }
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    if in_preview {
+                        self.scroll_preview_to(Pos::Last)
+                    } else {
+                        self.goto(Pos::Last)
+                    }
+                }
+                KeyCode::Home => {
+                    if in_preview {
+                        self.scroll_preview_to(Pos::First)
+                    } else {
+                        self.goto(Pos::First)
+                    }
+                }
+                KeyCode::Char('v') => {
+                    self.focus = Focus::List;
+                    self.toggle_view();
+                }
                 KeyCode::Char('p') => {
                     self.preview = !self.preview;
+                    if !self.preview {
+                        self.focus = Focus::List;
+                    }
                     self.set_status(if self.preview { "미리보기 켬" } else { "미리보기 끔" });
                 }
-                KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
-                KeyCode::Char('l') | KeyCode::Right => self.expand(),
-                KeyCode::Char('/') => self.mode = Mode::Filter,
+                // h/l 은 창 사이를 오간다. 트리 접기·펴기는 방향키와 Enter 로.
+                KeyCode::Char('h') => {
+                    if in_preview {
+                        self.focus = Focus::List;
+                    } else {
+                        self.collapse_or_parent();
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if !in_preview {
+                        self.enter_preview();
+                    }
+                }
+                KeyCode::Left => {
+                    if in_preview {
+                        self.focus = Focus::List;
+                    } else {
+                        self.collapse_or_parent();
+                    }
+                }
+                KeyCode::Right => {
+                    if !in_preview {
+                        self.expand();
+                    }
+                }
+                KeyCode::Char('/') => {
+                    self.focus = Focus::List;
+                    self.mode = Mode::Filter;
+                }
                 KeyCode::Char('s') if self.tab == Tab::Local => self.stash_selected(),
-                KeyCode::Char('x') if self.tab == Tab::Stashed => self.remove_selected(),
+                KeyCode::Char('x') if self.tab == Tab::Stashed => {
+                    self.focus = Focus::List;
+                    self.remove_selected();
+                }
                 KeyCode::Char('m') if self.tab == Tab::Stashed => {
                     if let Some(i) = self.selected_item() {
                         let cur = self.stash.borrow().entries[i].note.clone().unwrap_or_default();
+                        self.focus = Focus::List;
                         self.mode = Mode::Note(i, cur);
                     }
                 }
                 KeyCode::Enter => {
-                    if self.selected_dir().is_some() {
+                    if !in_preview && self.selected_dir().is_some() {
                         self.toggle_dir();
                     } else if let Some(exit) = self.open_selected() {
                         return Ok(exit);
@@ -452,6 +617,10 @@ impl Picker {
 
         // 폭이 좁으면 미리보기를 접는다.
         let show_preview = self.preview && body.width >= MIN_WIDTH_FOR_PREVIEW;
+        self.preview_visible = show_preview;
+        if !show_preview {
+            self.focus = Focus::List;
+        }
         let (list_area, preview_area) = if show_preview {
             let [l, r] = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
             (l, Some(r))
@@ -512,9 +681,13 @@ impl Picker {
             })
             .map(ListItem::new)
             .collect();
-        let list = List::new(items)
-            .highlight_style(Style::default().fg(Color::Indexed(110)).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▌ ");
+        let focused = self.focus == Focus::List;
+        let hl = if focused {
+            Style::default().fg(Color::Indexed(110)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Indexed(245))
+        };
+        let list = List::new(items).highlight_style(hl).highlight_symbol(if focused { "▌ " } else { "│ " });
         f.render_stateful_widget(list, area, &mut self.state);
     }
 
@@ -550,11 +723,21 @@ impl Picker {
     }
 
     fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::new().borders(Borders::LEFT).border_style(Style::default().fg(Color::Indexed(240)));
+        let focused = self.focus == Focus::Preview;
+        // 포커스가 들어오면 경계선을 또렷하게 해서 어느 창을 움직이는지 보여 준다.
+        let border_style = if focused {
+            Style::default().fg(Color::Indexed(110))
+        } else {
+            Style::default().fg(Color::Indexed(240))
+        };
+        let block = Block::new().borders(Borders::LEFT).border_style(border_style);
         let inner = block.inner(area).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
         f.render_widget(block, area);
+        self.preview_height = inner.height as usize;
+        let scroll = self.preview_scroll;
+        let height = inner.height as usize;
         let lines = self.preview_lines(inner.width as usize);
-        let shown: Vec<Line<'static>> = lines.iter().take(inner.height as usize).cloned().collect();
+        let shown: Vec<Line<'static>> = lines.iter().skip(scroll).take(height).cloned().collect();
         f.render_widget(Paragraph::new(shown), inner);
     }
 
@@ -570,10 +753,14 @@ impl Picker {
             },
         };
         if self.cache.as_ref().is_none_or(|c| c.key != key) {
+            // 다른 문서를 고르면 맨 위부터 보여 준다.
             let lines = self.render_preview(&key.0, width, dim);
+            self.preview_scroll = 0;
             self.cache = Some(PreviewCache { key, lines });
         }
-        &self.cache.as_ref().unwrap().lines
+        let lines = &self.cache.as_ref().unwrap().lines;
+        self.preview_len = lines.len();
+        lines
     }
 
     fn render_preview(&self, key: &str, width: usize, dim: Style) -> Vec<Line<'static>> {
@@ -628,11 +815,16 @@ impl Picker {
                         Tab::Local => "no markdown files found  Tab stashed  q quit".to_string(),
                         Tab::Stashed => "stash is empty — press s on a file, or: mdview stash FILE|URL  Tab local  q quit".to_string(),
                     }
+                } else if self.focus == Focus::Preview {
+                    // 미리보기 안에서는 그쪽 조작만 안내한다.
+                    let max = self.preview_len.saturating_sub(self.preview_height);
+                    let pct = (self.preview_scroll * 100).checked_div(max).unwrap_or(100);
+                    format!("preview {pct:>3}%  j/k gg/G ^d^u^f^b scroll  h/Esc back to list  Enter open  q quit")
                 } else {
                     let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{files} files  j/k gg/G ^d^u^f^b  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
-                        Tab::Stashed => format!("{files} stashed  j/k gg/G  Enter open  x remove  m note  p preview  / filter  Tab local  q quit{hint}"),
+                        Tab::Local => format!("{files} files  j/k gg/G ^d^u^f^b  l preview  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Stashed => format!("{files} stashed  j/k gg/G  l preview  Enter open  x remove  m note  / filter  Tab local  q quit{hint}"),
                     }
                 }
             }
@@ -752,6 +944,93 @@ mod tests {
         assert_eq!(at(&p), "docs/sub/b.md");
         p.collapse_or_parent();
         assert_eq!(at(&p), "docs/sub/");
+    }
+
+    #[test]
+    fn preview_scroll_clamps_at_both_ends() {
+        let mut p = picker(&["a.md"]);
+        p.preview_len = 100;
+        p.preview_height = 10;
+        p.scroll_preview(-5);
+        assert_eq!(p.preview_scroll, 0, "맨 위에서 더 올라가지 않는다");
+        p.scroll_preview(500);
+        assert_eq!(p.preview_scroll, 90, "마지막 화면이 꽉 찬 위치에서 멈춘다");
+        p.scroll_preview(1);
+        assert_eq!(p.preview_scroll, 90);
+    }
+
+    #[test]
+    fn preview_scroll_jumps_to_ends() {
+        let mut p = picker(&["a.md"]);
+        p.preview_len = 40;
+        p.preview_height = 12;
+        p.scroll_preview_to(Pos::Last);
+        assert_eq!(p.preview_scroll, 28);
+        p.scroll_preview_to(Pos::First);
+        assert_eq!(p.preview_scroll, 0);
+    }
+
+    #[test]
+    fn short_document_never_scrolls() {
+        let mut p = picker(&["a.md"]);
+        p.preview_len = 5;
+        p.preview_height = 20;
+        p.scroll_preview(10);
+        assert_eq!(p.preview_scroll, 0);
+        p.scroll_preview_to(Pos::Last);
+        assert_eq!(p.preview_scroll, 0);
+    }
+
+    #[test]
+    fn l_enters_the_preview_pane() {
+        let mut p = picker(&["a.md"]);
+        p.preview_visible = true;
+        assert_eq!(p.focus, Focus::List);
+        p.enter_preview();
+        assert_eq!(p.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn l_turns_the_preview_on_if_it_was_off() {
+        let mut p = picker(&["a.md"]);
+        p.preview = false;
+        p.enter_preview();
+        assert!(p.preview, "꺼져 있었으면 켜고 들어간다");
+        assert_eq!(p.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn narrow_window_refuses_to_enter_and_says_why() {
+        let mut p = picker(&["a.md"]);
+        p.preview = true;
+        p.preview_visible = false;
+        p.enter_preview();
+        assert_eq!(p.focus, Focus::List, "창이 좁으면 들어가지 않는다");
+        assert!(p.status.as_ref().unwrap().0.contains("좁아"));
+    }
+
+    #[test]
+    fn choosing_another_document_rewinds_the_preview() {
+        let dir = std::env::temp_dir().join(format!("mdview-rewind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [("a.md", "# A
+
+본문
+"), ("b.md", "# B
+
+본문
+")] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        let mut p = picker(&["a.md", "b.md"]);
+        p.root = dir.clone();
+        p.goto(Pos::First);
+        p.preview_lines(40); // a.md 를 캐시에 올린다
+        p.preview_scroll = 7;
+        p.goto(Pos::Last);
+        p.preview_lines(40); // b.md 로 바뀌면 처음부터
+        assert_eq!(p.preview_scroll, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

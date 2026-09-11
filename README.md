@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.0_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.1_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -114,7 +114,9 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 | `Ctrl-f` / `Ctrl-b`, `PgDn` / `PgUp` | 한 페이지 아래 / 위 |
 | `gg` / `G`, `Home` / `End` | 처음 / 끝 |
 | `Enter` | 파일이면 열기, 디렉터리면 접기·펴기 |
-| `h` / `l`, `←` / `→` | 디렉터리 접기 / 펴기 (파일 위에서 `h`는 상위 디렉터리로) |
+| `l` | **미리보기 창으로 들어가기** (꺼져 있으면 켜고 들어감) |
+| `←` / `→` | 디렉터리 접기 / 펴기 |
+| `h` | 디렉터리 접기 (파일 위에서는 상위 디렉터리로) |
 | `v` | 목록 보기 전환 (트리 ↔ 평면) |
 | `p` | 미리보기 창 켜기 / 끄기 |
 | `/` | 이름 필터 (필터 중에는 접힌 디렉터리도 펼쳐 보여 줍니다) |
@@ -135,11 +137,29 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
      markdown-sample.md                    │   glow 와 같은 터미널 마크다운 뷰어를
      sample.md                             │   Rust 로 구현한다.
    README.md                               │
- 5 files  j/k gg/G ^d^u^f^b  Enter open  v view  p preview  s stash  / filter  q quit
+ 5 files  j/k gg/G ^d^u^f^b  l preview  Enter open  v view  p preview  s stash  / filter  q quit
 ```
 
 미리보기는 선택한 문서를 실제 렌더러로 그리므로 수식·표·다이어그램까지 그대로 보입니다.
 창이 좁으면(76칸 미만) 자동으로 접히고, 1MB가 넘는 파일은 열기 전까지 렌더링하지 않습니다.
+
+### 미리보기 창 안에서
+
+`l`을 누르면 화면 구성은 그대로 둔 채 커서만 오른쪽 미리보기로 넘어갑니다. 목록의 선택 표시가
+흐려지고(`▌` → `│`) 미리보기 경계선이 또렷해져서 어느 쪽을 움직이는지 알 수 있습니다.
+여기서는 같은 이동 키가 문서를 위아래로 넘깁니다 — 전체 화면으로 연 것과 같은 감각입니다.
+
+| 키 | 동작 |
+|----|------|
+| `j` / `k`, `↓` / `↑` | 한 줄 스크롤 |
+| `Ctrl-d` / `Ctrl-u` | 반 페이지 |
+| `Ctrl-f` / `Ctrl-b`, `Space`, `PgDn` / `PgUp` | 한 페이지 |
+| `gg` / `G` | 문서 처음 / 끝 |
+| `h`, `Esc`, `←` | 목록으로 돌아가기 |
+| `Enter` | 전체 화면 페이저로 열기 |
+| `q` | 종료 |
+
+푸터에 `preview  42%` 처럼 현재 위치가 나옵니다. 다른 파일을 고르면 미리보기는 다시 맨 위부터 보여 줍니다.
 
 Local 탭은 `.gitignore`와 숨김 파일을 제외하고 하위 디렉터리까지 찾습니다.
 트리 보기가 기본이며, `v`로 경로를 한 줄씩 나열하는 평면 보기로 바꿀 수 있습니다.

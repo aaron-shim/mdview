@@ -1,6 +1,6 @@
 # mdview 개발 정리 및 설치 안내
 
-버전: 0.3.0 · 갱신일: 2026-09-11 (최초 작성 2026-09-10)
+버전: 0.3.1 · 갱신일: 2026-09-11 (최초 작성 2026-09-10)
 
 ## 1. 개요
 
@@ -12,7 +12,7 @@ mdview는 [glow](https://github.com/charmbracelet/glow)와 같은 터미널 마�
 
 | 항목 | 내용 |
 |------|------|
-| 버전 | 0.3.0 |
+| 버전 | 0.3.1 |
 | 언어 / 에디션 | Rust 2024, **최소 rustc 1.88** (`Cargo.toml`의 `rust-version`) |
 | 라이선스 | MIT |
 | 바이너리 이름 | `mdview` |
@@ -103,6 +103,14 @@ mdview는 [glow](https://github.com/charmbracelet/glow)와 같은 터미널 마�
 - 미리보기: `p`로 켜고 끈다(기본 켬). 오른쪽 창에 선택한 문서를 **실제 렌더러로** 그리므로
   수식·표·다이어그램까지 그대로 보인다. 같은 (경로, 폭)이면 다시 렌더링하지 않고 캐시를 쓴다.
   창 폭이 76칸 미만이면 자동으로 접고, 1MB가 넘는 파일과 원격 URL은 열기 전까지 렌더링하지 않는다.
+- 미리보기 안으로 들어가기: `l`을 누르면 화면 구성은 그대로 둔 채 키 입력만 오른쪽 창이 받는다.
+  목록 선택 표시가 `▌`에서 `│`로 흐려지고 미리보기 경계선이 또렷해져, 어느 창을 움직이는지 보인다.
+  같은 이동 키가 문서를 스크롤하고(`gg`/`G` 포함), `h`·`Esc`로 목록에 돌아온다.
+  푸터에 현재 위치가 백분율로 나온다. 다른 문서를 고르면 스크롤은 맨 위로 돌아간다
+  (캐시 키가 바뀌는 지점에서 한 번만 처리하므로 어디서 선택이 바뀌든 빠뜨리지 않는다).
+  `l`은 미리보기가 꺼져 있으면 켜고 들어가고, 창이 좁아 열 수 없으면 그 이유를 알린다.
+- `h`/`l`이 창 사이 이동을 맡으므로, 트리 접기·펴기는 방향키와 `Enter`가 담당한다
+  (파일 위에서의 `h`는 상위 디렉터리로 올라가는 동작을 그대로 유지한다).
 - 테마: `-s auto|dark|light|notty`. auto는 TTY면 dark, `COLORFGBG`로 밝은 배경 감지.
   `-s`를 안 주면 `MDVIEW_STYLE` 환경변수를 본다(macOS 터미널은 `COLORFGBG`를 안 내보내므로 여기서 지정).
   `--no-color`와 `NO_COLOR` 지원
@@ -200,6 +208,10 @@ docs/superpowers/specs/  최초 설계 문서
      `output/tree.rs`를 순수 함수로 분리해 단위 테스트를 붙였다
    - vi 이동 키(`j`/`k`, `Ctrl-d`/`u`/`f`/`b`, `gg`, `G`)
    - 디렉터리 계층 보기와 접기·펴기, `v`로 평면 보기와 전환
+12. 미리보기 창 안에서 문서 넘겨보기 (0.3.1)
+   - `l`로 화면 구성을 유지한 채 오른쪽 창에 포커스를 넘기고, 같은 이동 키로 스크롤
+   - 포커스 위치를 선택 표시(`▌`/`│`)와 경계선 색, 푸터 백분율로 드러냄
+   - `h`/`l`이 창 이동을 맡게 되어 트리 접기·펴기는 방향키·`Enter`로 정리
 
 ## 5. 설치
 
@@ -213,7 +225,7 @@ docs/superpowers/specs/  최초 설계 문서
 zip을 풀고 저장소 루트에서 실행하면 배포판을 감지해 알맞은 방식으로 설치합니다.
 
 ```sh
-unzip mdview-0.3.0.zip && cd mdview
+unzip mdview-0.3.1.zip && cd mdview
 ./install.sh
 ```
 
@@ -235,7 +247,7 @@ sudo apt install build-essential curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.0_amd64.deb   # arm64 등 아키텍처에 따라 다름
+sudo apt install ./dist/mdview_0.3.1_amd64.deb   # arm64 등 아키텍처에 따라 다름
 ```
 
 ### macOS 또는 cargo만 사용
@@ -284,9 +296,19 @@ mdview stash -r a.md                  # 스태시 제거
 | `Ctrl-f` / `Ctrl-b`, `PgDn` / `PgUp` | 한 페이지 |
 | `gg` / `G`, `Home` / `End` | 처음 / 끝 |
 | `Enter` | 파일이면 열기, 디렉터리면 접기·펴기 |
-| `h` / `l`, `←` / `→` | 디렉터리 접기 / 펴기 (파일 위 `h`는 상위로) |
+| `l` | 미리보기 창으로 들어가기 |
+| `h`, `←` / `→` | 디렉터리 접기 / 펴기 (파일 위 `h`는 상위로) |
 | `v` | 트리 ↔ 평면 보기 |
 | `p` | 미리보기 켜기 / 끄기 |
+
+미리보기 창 안에서(`l`로 진입):
+
+| 키 | 동작 |
+|----|------|
+| `j` / `k`, `Ctrl-d`/`Ctrl-u`, `Ctrl-f`/`Ctrl-b`, `Space` | 스크롤 |
+| `gg` / `G` | 문서 처음 / 끝 |
+| `h`, `Esc`, `←` | 목록으로 |
+| `Enter` | 전체 화면 페이저로 열기 |
 | `/` | 이름 필터 |
 | `Tab`, `1` / `2` | Local ↔ Stashed 탭 |
 | `s` | (Local) 스태시 저장 |
@@ -303,7 +325,7 @@ mdview stash -r a.md                  # 스태시 제거
 - .deb: `dpkg-deb --info/--contents`로 제어 파일과 파일 배치(root 소유) 확인, 추출한 바이너리 실행 확인
 
 ### 0.2.0 / 0.3.0 (Arch Linux에서 검증)
-- 테스트 166개 통과, `cargo clippy --all-targets` 경고 없음
+- 테스트 173개 통과, `cargo clippy --all-targets` 경고 없음
 - 통합 테스트: 예제 문서 전체를 폭 40~400으로 렌더링해 줄 넘침이 없는지 확인,
   잘린 mermaid·LaTeX 입력 40여 가지에 패닉이 없는지 확인
 - pty(가상 터미널)로 실제 화면을 재구성해 확인: 페이저가 기본으로 열리는지,
