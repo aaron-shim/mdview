@@ -1,7 +1,8 @@
 //! 마크다운 파일 브라우저 TUI: Local 탭(현재 디렉터리)과 Stashed 탭(즐겨찾기).
 //!
 //! 목록은 평면/트리 두 가지로 볼 수 있고(`v`), 오른쪽에 미리보기 창을 붙일 수
-//! 있다(`p`). 이동은 vi 키(j/k, Ctrl-d/u/f/b, gg, G)를 따른다.
+//! 있다(`p`). 이동은 vi 키(j/k, Ctrl-d/u/f/b, gg, G)를 따르고, 트리는 h/l 로
+//! 접고 편다(H/L 은 전체). 미리보기 창 폭은 구분선을 마우스로 끌어 바꾼다.
 
 use crate::output::tree::{self, Row};
 use crate::output::tui_convert;
@@ -9,7 +10,7 @@ use crate::source::Source;
 use crate::stash::Stash;
 use crate::theme::Theme;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -86,6 +87,14 @@ pub struct Picker {
     pending_g: bool,
     /// 마지막으로 그린 목록 높이(페이지 단위 이동에 쓴다)
     page: usize,
+    /// 목록 창이 차지하는 폭(본문 폭 대비 백분율). 구분선을 끌어 바꾼다.
+    split_pct: u16,
+    /// 구분선을 끌고 있는 중인지
+    dragging: bool,
+    /// 마지막으로 그린 본문·목록·미리보기 영역(마우스 판정에 쓴다)
+    body_area: Rect,
+    list_area: Rect,
+    preview_area: Option<Rect>,
 }
 
 pub enum PickerExit {
@@ -99,6 +108,11 @@ const STATUS_TTL: Duration = Duration::from_secs(2);
 const MIN_WIDTH_FOR_PREVIEW: u16 = 76;
 /// 미리보기로 읽을 최대 파일 크기
 const MAX_PREVIEW_BYTES: u64 = 1 << 20;
+/// 목록 창의 기본 폭(백분율)
+const DEFAULT_SPLIT_PCT: u16 = 42;
+/// 구분선을 끌 때 목록·미리보기가 각각 지켜야 하는 최소 폭
+const MIN_LIST_COLS: u16 = 20;
+const MIN_PREVIEW_COLS: u16 = 30;
 
 impl Picker {
     pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>, theme: Theme) -> Self {
@@ -124,6 +138,11 @@ impl Picker {
             preview_len: 0,
             pending_g: false,
             page: 10,
+            split_pct: DEFAULT_SPLIT_PCT,
+            dragging: false,
+            body_area: Rect::default(),
+            list_area: Rect::default(),
+            preview_area: None,
         };
         p.rebuild();
         p.select_first_item();
@@ -293,9 +312,9 @@ impl Picker {
         }
     }
 
-    /// 트리에서 접기(왼쪽). 파일 위에서는 부모 디렉터리로 올라간다.
+    /// `h`: 열린 디렉터리는 접고, 접힌 디렉터리나 파일 위에서는 부모 디렉터리로 올라간다.
     fn collapse_or_parent(&mut self) {
-        if self.selected_dir().is_some() {
+        if matches!(self.state.selected().and_then(|s| self.rows.get(s)), Some(Row::Dir { open: true, .. })) {
             self.toggle_dir();
             return;
         }
@@ -307,6 +326,72 @@ impl Picker {
         if let Some(pos) = self.rows[..sel].iter().rposition(|r| matches!(r, Row::Dir { depth: d, .. } if *d < depth)) {
             self.state.select(Some(pos));
         }
+    }
+
+    /// `l`: 디렉터리면 펴고(이미 열려 있으면 첫 하위 항목으로), 파일이면 미리보기 창으로 들어간다.
+    fn expand_or_enter_preview(&mut self) {
+        if self.selected_dir().is_some() {
+            self.expand();
+        } else {
+            self.enter_preview();
+        }
+    }
+
+    /// 트리의 모든 디렉터리 경로(조상 포함).
+    fn all_dirs(&self) -> HashSet<PathBuf> {
+        let mut dirs = HashSet::new();
+        for f in &self.files {
+            let mut p = f.parent();
+            while let Some(d) = p {
+                if d.as_os_str().is_empty() {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                p = d.parent();
+            }
+        }
+        dirs
+    }
+
+    /// `H`: 모든 디렉터리를 접는다. 커서는 보고 있던 항목이 속한 최상위 디렉터리에 둔다.
+    fn collapse_all(&mut self) {
+        if self.tab != Tab::Local || self.view != View::Tree {
+            return;
+        }
+        let top = self.state.selected().and_then(|s| self.rows.get(s)).map(|r| match r {
+            Row::Dir { path, .. } => path.clone(),
+            Row::Item { idx, .. } => self.files[*idx].clone(),
+        });
+        self.collapsed = self.all_dirs();
+        self.rebuild();
+        let top_dir = top.and_then(|p| p.components().next().map(|c| PathBuf::from(c.as_os_str())));
+        match top_dir.and_then(|d| self.rows.iter().position(|r| matches!(r, Row::Dir { path, .. } if *path == d))) {
+            Some(pos) => self.state.select(Some(pos)),
+            None => self.goto(Pos::First),
+        }
+        self.set_status("모든 디렉터리 접음");
+    }
+
+    /// `L`: 모든 디렉터리를 편다. 커서는 같은 항목을 계속 가리킨다.
+    fn expand_all(&mut self) {
+        if self.tab != Tab::Local || self.view != View::Tree {
+            return;
+        }
+        let current = self.state.selected().and_then(|s| self.rows.get(s)).cloned();
+        self.collapsed.clear();
+        self.rebuild();
+        let pos = current.and_then(|cur| {
+            self.rows.iter().position(|r| match (&cur, r) {
+                (Row::Dir { path: a, .. }, Row::Dir { path: b, .. }) => a == b,
+                (Row::Item { idx: a, .. }, Row::Item { idx: b, .. }) => a == b,
+                _ => false,
+            })
+        });
+        match pos {
+            Some(pos) => self.state.select(Some(pos)),
+            None => self.select_first_item(),
+        }
+        self.set_status("모든 디렉터리 폄");
     }
 
     fn expand(&mut self) {
@@ -353,6 +438,66 @@ impl Picker {
         self.rebuild();
     }
 
+    // ------------------------------------------------------------ 마우스
+
+    fn on_divider(&self, x: u16) -> bool {
+        self.preview_area.is_some_and(|p| x + 1 >= p.x && x <= p.x + 1)
+    }
+
+    /// 구분선을 `x` 열로 옮긴다. 양쪽 창의 최소 폭은 지킨다.
+    fn set_split_at(&mut self, x: u16) {
+        let body = self.body_area;
+        if body.width < MIN_LIST_COLS + MIN_PREVIEW_COLS {
+            return;
+        }
+        let rel = x.saturating_sub(body.x).clamp(MIN_LIST_COLS, body.width - MIN_PREVIEW_COLS);
+        self.split_pct = (u32::from(rel) * 100 / u32::from(body.width)) as u16;
+    }
+
+    /// 본문 폭에 맞춘 목록 창 폭.
+    fn list_width(&self, body: Rect) -> u16 {
+        let w = (u32::from(body.width) * u32::from(self.split_pct) / 100) as u16;
+        w.clamp(MIN_LIST_COLS, body.width.saturating_sub(MIN_PREVIEW_COLS).max(MIN_LIST_COLS))
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let in_list = rect_contains(self.list_area, x, y);
+        let in_preview = self.preview_area.is_some_and(|a| rect_contains(a, x, y));
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.on_divider(x) {
+                    self.dragging = true;
+                } else if in_list {
+                    self.focus = Focus::List;
+                    let row = usize::from(y - self.list_area.y) + self.state.offset();
+                    if row < self.rows.len() {
+                        self.state.select(Some(row));
+                    }
+                } else if in_preview {
+                    self.focus = Focus::Preview;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => self.set_split_at(x),
+            MouseEventKind::Up(_) => self.dragging = false,
+            MouseEventKind::ScrollDown => {
+                if in_preview {
+                    self.scroll_preview(3);
+                } else if in_list {
+                    self.move_sel(1);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if in_preview {
+                    self.scroll_preview(-3);
+                } else if in_list {
+                    self.move_sel(-1);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_selected(&self) -> Option<PickerExit> {
         let i = self.selected_item()?;
         Some(match self.tab {
@@ -378,10 +523,16 @@ impl Picker {
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
-            let Event::Key(k) = event::read()? else { continue };
-            if k.kind == KeyEventKind::Release {
-                continue;
-            }
+            let k = match event::read()? {
+                Event::Key(k) if k.kind != KeyEventKind::Release => k,
+                Event::Mouse(m) => {
+                    if matches!(self.mode, Mode::Normal) {
+                        self.on_mouse(m);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
             match &mut self.mode {
                 Mode::Filter => {
@@ -554,30 +705,26 @@ impl Picker {
                     }
                     self.set_status(if self.preview { "미리보기 켬" } else { "미리보기 끔" });
                 }
-                // h/l 은 창 사이를 오간다. 트리 접기·펴기는 방향키와 Enter 로.
-                KeyCode::Char('h') => {
+                // h/l: 트리에서 접기/펴기. 파일 위의 l 은 미리보기로, 미리보기 안의 h 는 목록으로.
+                KeyCode::Char('h') | KeyCode::Left => {
                     if in_preview {
                         self.focus = Focus::List;
                     } else {
                         self.collapse_or_parent();
                     }
                 }
-                KeyCode::Char('l') => {
+                KeyCode::Char('l') | KeyCode::Right => {
                     if !in_preview {
-                        self.enter_preview();
+                        self.expand_or_enter_preview();
                     }
                 }
-                KeyCode::Left => {
-                    if in_preview {
-                        self.focus = Focus::List;
-                    } else {
-                        self.collapse_or_parent();
-                    }
+                KeyCode::Char('H') => {
+                    self.focus = Focus::List;
+                    self.collapse_all();
                 }
-                KeyCode::Right => {
-                    if !in_preview {
-                        self.expand();
-                    }
+                KeyCode::Char('L') => {
+                    self.focus = Focus::List;
+                    self.expand_all();
                 }
                 KeyCode::Char('/') => {
                     self.focus = Focus::List;
@@ -622,11 +769,14 @@ impl Picker {
             self.focus = Focus::List;
         }
         let (list_area, preview_area) = if show_preview {
-            let [l, r] = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
+            let [l, r] = Layout::horizontal([Constraint::Length(self.list_width(body)), Constraint::Min(0)]).areas(body);
             (l, Some(r))
         } else {
             (body, None)
         };
+        self.body_area = body;
+        self.list_area = list_area;
+        self.preview_area = preview_area;
 
         self.draw_list(f, list_area);
         if let Some(area) = preview_area {
@@ -723,7 +873,7 @@ impl Picker {
     }
 
     fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
-        let focused = self.focus == Focus::Preview;
+        let focused = self.focus == Focus::Preview || self.dragging;
         // 포커스가 들어오면 경계선을 또렷하게 해서 어느 창을 움직이는지 보여 준다.
         let border_style = if focused {
             Style::default().fg(Color::Indexed(110))
@@ -823,7 +973,7 @@ impl Picker {
                 } else {
                     let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{files} files  j/k gg/G ^d^u^f^b  l preview  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
                         Tab::Stashed => format!("{files} stashed  j/k gg/G  l preview  Enter open  x remove  m note  / filter  Tab local  q quit{hint}"),
                     }
                 }
@@ -836,6 +986,10 @@ impl Picker {
 enum Pos {
     First,
     Last,
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 #[cfg(test)]
@@ -944,6 +1098,126 @@ mod tests {
         assert_eq!(at(&p), "docs/sub/b.md");
         p.collapse_or_parent();
         assert_eq!(at(&p), "docs/sub/");
+    }
+
+    #[test]
+    fn h_on_a_collapsed_directory_goes_to_parent_not_expand() {
+        let mut p = picker(&["docs/sub/b.md", "docs/a.md"]);
+        // docs/sub/ 로 가서 접는다
+        let pos = p.rows.iter().position(|r| matches!(r, Row::Dir { path, .. } if path == &PathBuf::from("docs/sub"))).unwrap();
+        p.state.select(Some(pos));
+        p.collapse_or_parent();
+        assert_eq!(at(&p), "docs/sub/(접힘)");
+        // 접힌 디렉터리에서 h 를 다시 누르면 펴지지 않고 부모로 간다
+        p.collapse_or_parent();
+        assert_eq!(at(&p), "docs/");
+        assert!(p.collapsed.contains(&PathBuf::from("docs/sub")), "접힘 상태는 그대로");
+    }
+
+    #[test]
+    fn l_expands_a_collapsed_directory_then_steps_inside() {
+        let mut p = picker(&["docs/a.md", "top.md"]);
+        p.goto(Pos::First);
+        p.toggle_dir();
+        assert_eq!(at(&p), "docs/(접힘)");
+        p.expand_or_enter_preview();
+        assert_eq!(at(&p), "docs/", "첫 l 은 편다");
+        p.expand_or_enter_preview();
+        assert_eq!(at(&p), "docs/a.md", "열린 디렉터리에서 l 은 첫 하위로");
+        p.preview_visible = true;
+        p.expand_or_enter_preview();
+        assert_eq!(p.focus, Focus::Preview, "파일 위에서 l 은 미리보기로");
+    }
+
+    #[test]
+    fn collapse_all_and_expand_all_keep_context() {
+        let mut p = picker(&["a/x.md", "a/b/y.md", "c/z.md", "top.md"]);
+        // a/b/y.md 를 보고 있다가 전체 접기
+        p.goto(Pos::First);
+        while at(&p) != "a/b/y.md" {
+            p.move_sel(1);
+        }
+        p.collapse_all();
+        assert_eq!(p.rows.len(), 3, "a/, c/, top.md 만 남는다");
+        assert_eq!(at(&p), "a/(접힘)", "보던 항목의 최상위 디렉터리에 선다");
+        // 전체 펴기: 접힌 것이 없고 커서는 같은 행(a/)에 남는다
+        p.expand_all();
+        assert!(p.collapsed.is_empty());
+        assert_eq!(at(&p), "a/");
+        assert_eq!(p.rows.len(), 7);
+    }
+
+    #[test]
+    fn expand_all_keeps_the_selected_file() {
+        let mut p = picker(&["a/x.md", "a/b/y.md"]);
+        p.goto(Pos::First);
+        p.toggle_dir(); // a/ 접기
+        p.expand_all();
+        p.goto(Pos::Last);
+        let before = at(&p);
+        p.expand_all();
+        assert_eq!(at(&p), before);
+    }
+
+    #[test]
+    fn divider_drag_respects_minimum_widths() {
+        let mut p = picker(&["a.md"]);
+        p.body_area = Rect::new(0, 1, 100, 30);
+        p.set_split_at(10);
+        assert_eq!(p.list_width(p.body_area), MIN_LIST_COLS, "목록은 최소 폭 아래로 줄지 않는다");
+        p.set_split_at(95);
+        assert_eq!(p.list_width(p.body_area), 100 - MIN_PREVIEW_COLS, "미리보기도 최소 폭을 지킨다");
+        p.set_split_at(60);
+        assert_eq!(p.list_width(p.body_area), 60);
+    }
+
+    #[test]
+    fn divider_drag_is_ignored_when_the_body_is_too_narrow() {
+        let mut p = picker(&["a.md"]);
+        p.body_area = Rect::new(0, 1, 40, 30);
+        let before = p.split_pct;
+        p.set_split_at(30);
+        assert_eq!(p.split_pct, before);
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::empty() }
+    }
+
+    #[test]
+    fn dragging_the_divider_moves_the_split() {
+        let mut p = picker(&["a.md"]);
+        p.body_area = Rect::new(0, 1, 100, 30);
+        p.list_area = Rect::new(0, 1, 42, 30);
+        p.preview_area = Some(Rect::new(42, 1, 58, 30));
+        p.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 42, 5));
+        assert!(p.dragging);
+        p.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 5));
+        assert_eq!(p.list_width(p.body_area), 70);
+        p.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 70, 5));
+        assert!(!p.dragging);
+        // 구분선이 아닌 곳을 눌러도 끌기가 시작되지 않는다
+        p.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 5));
+        assert!(!p.dragging);
+    }
+
+    #[test]
+    fn clicking_a_row_selects_it_and_wheel_scrolls_the_right_pane() {
+        let mut p = picker(&["a.md", "b.md", "c.md"]);
+        p.body_area = Rect::new(0, 1, 100, 30);
+        p.list_area = Rect::new(0, 1, 42, 30);
+        p.preview_area = Some(Rect::new(42, 1, 58, 30));
+        p.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 3));
+        assert_eq!(at(&p), "c.md", "세 번째 줄을 누르면 c.md");
+        assert_eq!(p.focus, Focus::List);
+        p.on_mouse(mouse(MouseEventKind::ScrollUp, 5, 3));
+        assert_eq!(at(&p), "b.md");
+        p.preview_len = 100;
+        p.preview_height = 10;
+        p.on_mouse(mouse(MouseEventKind::ScrollDown, 60, 3));
+        assert_eq!(p.preview_scroll, 3, "미리보기 위에서 휠은 미리보기를 움직인다");
+        p.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 3));
+        assert_eq!(p.focus, Focus::Preview, "미리보기를 누르면 포커스가 옮겨진다");
     }
 
     #[test]

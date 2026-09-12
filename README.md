@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.1_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.2_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -114,9 +114,9 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 | `Ctrl-f` / `Ctrl-b`, `PgDn` / `PgUp` | 한 페이지 아래 / 위 |
 | `gg` / `G`, `Home` / `End` | 처음 / 끝 |
 | `Enter` | 파일이면 열기, 디렉터리면 접기·펴기 |
-| `l` | **미리보기 창으로 들어가기** (꺼져 있으면 켜고 들어감) |
-| `←` / `→` | 디렉터리 접기 / 펴기 |
-| `h` | 디렉터리 접기 (파일 위에서는 상위 디렉터리로) |
+| `h`, `←` | 디렉터리 접기 (접힌 디렉터리·파일 위에서는 상위 디렉터리로) |
+| `l`, `→` | 디렉터리 펴기 (열린 디렉터리면 첫 하위 항목으로), **파일 위에서는 미리보기 창으로 들어가기** |
+| `H` / `L` | 모든 디렉터리 접기 / 펴기 |
 | `v` | 목록 보기 전환 (트리 ↔ 평면) |
 | `p` | 미리보기 창 켜기 / 끄기 |
 | `/` | 이름 필터 (필터 중에는 접힌 디렉터리도 펼쳐 보여 줍니다) |
@@ -125,6 +125,9 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 | `x` | (Stashed 탭) 스태시에서 제거 |
 | `m` | (Stashed 탭) 메모 편집 |
 | `q` | 종료 |
+
+마우스: 목록과 미리보기 사이의 구분선을 끌어 미리보기 폭을 바꿀 수 있습니다. 휠은 커서가 있는 창을 스크롤하고,
+클릭은 행을 선택하거나 창의 포커스를 옮깁니다.
 
 ```
  mdview   Local   Stashed (2)   ~/w/mdview
