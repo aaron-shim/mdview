@@ -1,6 +1,6 @@
 [package]
 name = "mdview"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 # let-chains(`if let ... && ...`)를 쓰므로 1.88 이상이 필요하다.
 rust-version = "1.88"

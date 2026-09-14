@@ -4,7 +4,7 @@ use crate::hangul;
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -128,19 +128,36 @@ pub fn is_markdown(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `root` 아래의 마크다운 파일을 .gitignore를 존중하며 찾는다. 결과는 root 기준 상대 경로.
-pub fn find_markdown_files(root: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+/// 파일이 바뀌었는지 알아채기 위한 표식: (수정 시각, 크기).
+pub type Stamp = (Option<SystemTime>, u64);
+
+/// 한 파일의 현재 표식. 읽을 수 없으면 None.
+pub fn stamp_of(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok(), m.len()))
+}
+
+/// `root` 아래의 마크다운 파일을 .gitignore를 존중하며 찾는다. 결과는 root 기준 상대 경로이며,
+/// 변경 감지에 쓸 표식을 함께 돌려준다.
+///
+/// 다른 파일 시스템(`/proc`, 네트워크 마운트 등)으로는 내려가지 않는다.
+/// 상위 폴더로 올라가며 넓은 범위를 훑을 때 엉뚱한 곳까지 뒤지지 않게 하려는 것이다.
+pub fn scan_markdown_files(root: &Path) -> Vec<(PathBuf, Stamp)> {
+    let mut files: Vec<(PathBuf, Stamp)> = ignore::WalkBuilder::new(root)
         .hidden(true)
         .max_depth(Some(6))
+        .same_file_system(true)
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .map(|e| e.into_path())
-        .filter(|p| is_markdown(p))
-        .map(|p| p.strip_prefix(root).map(Path::to_path_buf).unwrap_or(p))
+        .filter(|e| is_markdown(e.path()))
+        .map(|e| {
+            let stamp = e.metadata().map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0));
+            let rel = e.path().strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| e.path().to_path_buf());
+            (rel, stamp)
+        })
         .collect();
-    files.sort_by(|a, b| {
+    files.sort_by(|(a, _), (b, _)| {
         let da = a.components().count();
         let db = b.components().count();
         da.cmp(&db).then_with(|| a.cmp(b))
@@ -169,7 +186,7 @@ mod tests {
         std::fs::write(dir.join("b.md"), "x").unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         std::fs::write(dir.join("sub/c.markdown"), "x").unwrap();
-        let files = find_markdown_files(&dir);
+        let files: Vec<PathBuf> = scan_markdown_files(&dir).into_iter().map(|(p, _)| p).collect();
         assert_eq!(files, vec![PathBuf::from("b.md"), PathBuf::from("sub/c.markdown")]);
         let _ = std::fs::remove_dir_all(&dir);
     }

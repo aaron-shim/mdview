@@ -223,15 +223,38 @@ fn open_pager(
     stash: Rc<RefCell<Stash>>,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<PagerExit> {
-    let text = doc.text;
+    // 파일 문서는 편집기에서 고치는 동안에도 따라가도록 내용을 공유해 둔다.
+    let text = Rc::new(RefCell::new(doc.text));
+    let reload = match &doc.source {
+        Source::File(p) => Some(file_reloader(p.clone(), text.clone())),
+        _ => None,
+    };
     let theme = theme.clone();
     let fixed_width = cli.width;
     let rerender = Box::new(move |term_w: usize| {
         let w = if fixed_width > 0 { fixed_width.min(term_w) } else { term_w.min(MAX_WIDTH) };
-        render::render(&text, &theme, w)
+        render::render(&text.borrow(), &theme, w)
     });
-    let mut pager = Pager::new(doc.title, terminal_width(), rerender, from_picker, stash, doc.source.stash_key());
+    let mut pager = Pager::new(doc.title, terminal_width(), rerender, from_picker, stash, doc.source.stash_key(), reload);
     pager.run(terminal)
+}
+
+/// 파일이 바뀌었는지 살피는 콜백. 바뀌었으면 `text`를 새 내용으로 채우고 true.
+///
+/// 편집기가 저장하며 잠깐 파일을 지웠다가 다시 만드는 경우가 있어,
+/// 파일이 안 보이는 순간에는 기다렸다가 다음 확인에서 읽는다.
+fn file_reloader(path: PathBuf, text: Rc<RefCell<String>>) -> Box<dyn FnMut() -> bool> {
+    let mut last = source::stamp_of(&path);
+    Box::new(move || {
+        let now = source::stamp_of(&path);
+        if now.is_none() || now == last {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { return false };
+        last = now;
+        *text.borrow_mut() = hangul::compose(&String::from_utf8_lossy(&bytes));
+        true
+    })
 }
 
 fn browse(cli: &Cli, theme: Theme, root: PathBuf, stash: Rc<RefCell<Stash>>) -> Result<()> {
@@ -239,8 +262,11 @@ fn browse(cli: &Cli, theme: Theme, root: PathBuf, stash: Rc<RefCell<Stash>>) -> 
         bail!("no input given and stdout is not a terminal (try: mdview FILE.md)");
     }
     let root = root.canonicalize().unwrap_or(root);
-    let files = source::find_markdown_files(&root);
+    let scan = source::scan_markdown_files(&root);
+    let files = scan.iter().map(|(p, _)| p.clone()).collect();
     let mut picker = Picker::new(root, files, stash.clone(), theme.clone());
+    // 파일이 생기거나 바뀌면 목록과 미리보기를 자동으로 갱신한다.
+    picker.start_watching(scan);
     // 페이저와 브라우저를 오갈 때 터미널을 한 번만 초기화한다.
     let mut terminal = init_terminal();
     let result = browse_loop(cli, &theme, &mut picker, stash, &mut terminal);
@@ -269,6 +295,24 @@ fn browse_loop(cli: &Cli, theme: &Theme, picker: &mut Picker, stash: Rc<RefCell<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_reloader_notices_edits_once() {
+        let dir = std::env::temp_dir().join(format!("mdview-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# 처음").unwrap();
+        let text = Rc::new(RefCell::new(String::from("# 처음")));
+        let mut reload = file_reloader(file.clone(), text.clone());
+        assert!(!reload(), "그대로면 다시 읽지 않는다");
+        std::fs::write(&file, "# 고친 내용입니다").unwrap();
+        assert!(reload(), "바뀌면 다시 읽는다");
+        assert_eq!(*text.borrow(), "# 고친 내용입니다");
+        assert!(!reload(), "한 번 읽은 변경은 다시 알리지 않는다");
+        std::fs::remove_file(&file).unwrap();
+        assert!(!reload(), "잠깐 사라진 동안에는 기다린다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn style_env_values_parse() {

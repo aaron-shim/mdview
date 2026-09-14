@@ -14,18 +14,21 @@ pub enum Row {
     Item { idx: usize, depth: usize },
     /// 디렉터리(트리 보기에서만 나온다).
     Dir { path: PathBuf, depth: usize, open: bool, files: usize },
+    /// 상위 폴더로 가는 `../` 행. 파일 브라우저가 목록 맨 위에 붙인다.
+    Parent,
 }
 
 impl Row {
     pub fn depth(&self) -> usize {
         match self {
             Row::Item { depth, .. } | Row::Dir { depth, .. } => *depth,
+            Row::Parent => 0,
         }
     }
     pub fn item_index(&self) -> Option<usize> {
         match self {
             Row::Item { idx, .. } => Some(*idx),
-            Row::Dir { .. } => None,
+            Row::Dir { .. } | Row::Parent => None,
         }
     }
 }
@@ -102,6 +105,7 @@ mod tests {
                     format!("{}{}/ ({files}){}", "  ".repeat(*depth), path.file_name().unwrap().to_string_lossy(), if *open { "" } else { " [접힘]" })
                 }
                 Row::Item { idx, depth } => format!("{}#{idx}", "  ".repeat(*depth)),
+                Row::Parent => "../".to_string(),
             })
             .collect()
     }

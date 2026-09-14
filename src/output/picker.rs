@@ -6,7 +6,8 @@
 
 use crate::output::tree::{self, Row};
 use crate::output::tui_convert;
-use crate::source::Source;
+use crate::output::watch::{Snapshot, Watcher};
+use crate::source::{self, Source, Stamp};
 use crate::stash::Stash;
 use crate::theme::Theme;
 use anyhow::Result;
@@ -17,8 +18,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,13 @@ use std::time::{Duration, Instant};
 pub enum Tab {
     Local,
     Stashed,
+}
+
+/// 목록에 잠시 붙여 두는 변경 표시.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    Added,
+    Modified,
 }
 
 /// 키 입력을 받는 창.
@@ -54,6 +62,8 @@ enum Mode {
 /// 미리보기로 그려 둔 내용. 같은 (경로, 폭)이면 다시 렌더링하지 않는다.
 struct PreviewCache {
     key: (String, usize),
+    /// 렌더링할 때의 파일 표식. 달라지면 같은 문서라도 다시 그린다.
+    stamp: Option<Stamp>,
     lines: Vec<Line<'static>>,
 }
 
@@ -95,6 +105,18 @@ pub struct Picker {
     body_area: Rect,
     list_area: Rect,
     preview_area: Option<Rect>,
+    /// 목록 자동 갱신용 백그라운드 감시기(테스트에서는 없다)
+    watcher: Option<Watcher>,
+    /// 마지막으로 반영한 파일 표식. 다음 스냅숏과 비교하는 기준
+    stamps: Vec<(PathBuf, Stamp)>,
+    /// `stamps`가 지금 루트 기준으로 유효한지(루트를 바꾸면 첫 결과는 비교하지 않는다)
+    baseline: bool,
+    /// 최근에 생기거나 바뀐 파일(루트 기준 상대 경로)
+    changed: HashMap<PathBuf, (Change, Instant)>,
+    /// 상위로 올라온 뒤 커서를 둘 폴더 이름
+    came_from: Option<PathBuf>,
+    /// 새 루트를 훑는 중인지
+    scanning: bool,
 }
 
 pub enum PickerExit {
@@ -113,6 +135,8 @@ const DEFAULT_SPLIT_PCT: u16 = 42;
 /// 구분선을 끌 때 목록·미리보기가 각각 지켜야 하는 최소 폭
 const MIN_LIST_COLS: u16 = 20;
 const MIN_PREVIEW_COLS: u16 = 30;
+/// 새로 생기거나 바뀐 파일에 표시를 붙여 두는 시간
+const CHANGE_TTL: Duration = Duration::from_secs(30);
 
 impl Picker {
     pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>, theme: Theme) -> Self {
@@ -143,6 +167,12 @@ impl Picker {
             body_area: Rect::default(),
             list_area: Rect::default(),
             preview_area: None,
+            watcher: None,
+            stamps: Vec::new(),
+            baseline: false,
+            changed: HashMap::new(),
+            came_from: None,
+            scanning: false,
         };
         p.rebuild();
         p.select_first_item();
@@ -171,6 +201,7 @@ impl Picker {
 
     /// 필터·보기 방식·접힘 상태를 반영해 행을 다시 만든다.
     fn rebuild(&mut self) {
+        let had_parent = matches!(self.rows.first(), Some(Row::Parent));
         let q = self.filter.to_lowercase();
         let keep: Vec<usize> = (0..self.item_count()).filter(|&i| q.is_empty() || self.item_text(i).to_lowercase().contains(&q)).collect();
         self.rows = match self.tab {
@@ -182,11 +213,22 @@ impl Picker {
             }
             _ => tree::flat_rows(&keep.iter().map(|&i| (i, PathBuf::new())).collect::<Vec<_>>()),
         };
+        // Local 탭 맨 위에 상위 폴더로 가는 `../` 행을 둔다. 필터 중에는 숨긴다.
+        let has_parent = self.tab == Tab::Local && q.is_empty() && self.root.parent().is_some();
+        if has_parent {
+            self.rows.insert(0, Row::Parent);
+        }
         if self.rows.is_empty() {
             self.state.select(None);
         } else {
-            let sel = self.state.selected().unwrap_or(0).min(self.rows.len() - 1);
-            self.state.select(Some(sel));
+            // `../` 행이 생기거나 사라져도 같은 항목을 가리키도록 한 칸 보정한다.
+            let mut sel = self.state.selected().unwrap_or(0);
+            match (had_parent, has_parent) {
+                (false, true) if self.state.selected().is_some() => sel += 1,
+                (true, false) => sel = sel.saturating_sub(1),
+                _ => {}
+            }
+            self.state.select(Some(sel.min(self.rows.len() - 1)));
         }
     }
 
@@ -358,9 +400,10 @@ impl Picker {
         if self.tab != Tab::Local || self.view != View::Tree {
             return;
         }
-        let top = self.state.selected().and_then(|s| self.rows.get(s)).map(|r| match r {
-            Row::Dir { path, .. } => path.clone(),
-            Row::Item { idx, .. } => self.files[*idx].clone(),
+        let top = self.state.selected().and_then(|s| self.rows.get(s)).and_then(|r| match r {
+            Row::Dir { path, .. } => Some(path.clone()),
+            Row::Item { idx, .. } => Some(self.files[*idx].clone()),
+            Row::Parent => None,
         });
         self.collapsed = self.all_dirs();
         self.rebuild();
@@ -498,6 +541,135 @@ impl Picker {
         }
     }
 
+    // ------------------------------------------------------------ 상위 폴더 · 자동 갱신
+
+    /// 백그라운드에서 루트를 다시 훑어 목록을 자동으로 갱신한다. `scan`은 이미 보여 준 목록.
+    pub fn start_watching(&mut self, scan: Vec<(PathBuf, Stamp)>) {
+        self.watcher = Some(Watcher::spawn(self.root.clone(), scan.clone()));
+        self.stamps = scan;
+        self.baseline = true;
+    }
+
+    fn on_parent_row(&self) -> bool {
+        matches!(self.state.selected().and_then(|s| self.rows.get(s)), Some(Row::Parent))
+    }
+
+    /// 상위 폴더로 올라간다. 올라오기 전 폴더에 커서를 두고, 나머지 형제 폴더는 접어 둔다.
+    fn go_parent(&mut self) {
+        if self.tab != Tab::Local {
+            return;
+        }
+        let Some(parent) = self.root.parent().map(Path::to_path_buf) else {
+            self.set_status("최상위 폴더입니다");
+            return;
+        };
+        let from = self.root.file_name().map(PathBuf::from);
+        // 접어 두었던 폴더는 새 루트 기준 경로로 옮겨 그대로 유지한다.
+        if let Some(name) = &from {
+            self.collapsed = self.collapsed.iter().map(|p| name.join(p)).collect();
+        }
+        self.root = parent.clone();
+        self.came_from = from;
+        self.filter.clear();
+        self.changed.clear();
+        self.baseline = false;
+        self.cache = None;
+        self.focus = Focus::List;
+        self.set_status(format!("상위 폴더: {}", short(&parent)));
+        match &self.watcher {
+            Some(w) => {
+                // 넓은 폴더는 훑는 데 시간이 걸린다. 화면을 멈추지 않고 결과를 기다린다.
+                w.set_root(parent);
+                self.files.clear();
+                self.stamps.clear();
+                self.scanning = true;
+                self.rebuild();
+                self.state.select(Some(0));
+            }
+            None => {
+                let files = source::scan_markdown_files(&parent);
+                self.apply_snapshot(Snapshot { root: parent, files });
+            }
+        }
+    }
+
+    /// 새로 훑은 결과를 목록에 반영한다. 커서는 같은 항목을 계속 가리킨다.
+    fn apply_snapshot(&mut self, snap: Snapshot) {
+        // 루트를 바꾸기 전에 출발한 늦은 결과는 버린다.
+        if snap.root != self.root {
+            return;
+        }
+        let anchor = self.anchor();
+        if self.baseline {
+            let d = crate::output::watch::diff(&self.stamps, &snap.files);
+            let now = Instant::now();
+            for p in &d.added {
+                self.changed.insert(p.clone(), (Change::Added, now));
+            }
+            for p in &d.modified {
+                self.changed.insert(p.clone(), (Change::Modified, now));
+            }
+            for p in &d.removed {
+                self.changed.remove(p);
+            }
+            if !d.is_empty() {
+                self.set_status(d.summary());
+            }
+        }
+        self.files = snap.files.iter().map(|(p, _)| p.clone()).collect();
+        self.stamps = snap.files;
+        self.baseline = true;
+        self.scanning = false;
+
+        if let Some(from) = self.came_from.take() {
+            for f in &self.files {
+                if f.components().count() > 1
+                    && let Some(top) = f.components().next().map(|c| PathBuf::from(c.as_os_str()))
+                    && top != from
+                {
+                    self.collapsed.insert(top);
+                }
+            }
+            self.rebuild();
+            match self.rows.iter().position(|r| matches!(r, Row::Dir { path, .. } if *path == from)) {
+                Some(pos) => self.state.select(Some(pos)),
+                None => self.select_first_item(),
+            }
+            return;
+        }
+        self.rebuild();
+        self.restore(anchor);
+    }
+
+    /// 목록이 바뀌어도 커서를 되찾기 위한 표식.
+    fn anchor(&self) -> Option<Anchor> {
+        match self.state.selected().and_then(|s| self.rows.get(s))? {
+            Row::Parent => Some(Anchor::Parent),
+            Row::Dir { path, .. } => Some(Anchor::Dir(path.clone())),
+            Row::Item { idx, .. } if self.tab == Tab::Local => self.files.get(*idx).cloned().map(Anchor::File),
+            Row::Item { .. } => None,
+        }
+    }
+
+    fn restore(&mut self, anchor: Option<Anchor>) {
+        let Some(a) = anchor else { return };
+        let pos = self.rows.iter().position(|r| match (&a, r) {
+            (Anchor::Parent, Row::Parent) => true,
+            (Anchor::Dir(p), Row::Dir { path, .. }) => p == path,
+            (Anchor::File(p), Row::Item { idx, .. }) => self.files.get(*idx) == Some(p),
+            _ => false,
+        });
+        // 보던 파일이 지워졌으면 rebuild 가 맞춰 둔 위치에 남는다.
+        if let Some(pos) = pos {
+            self.state.select(Some(pos));
+        }
+    }
+
+    /// 오래된 변경 표시를 지운다.
+    fn prune_changes(&mut self) {
+        self.changed.retain(|_, (_, t)| t.elapsed() < CHANGE_TTL);
+    }
+
     fn open_selected(&self) -> Option<PickerExit> {
         let i = self.selected_item()?;
         Some(match self.tab {
@@ -519,6 +691,10 @@ impl Picker {
         // 페이저에서 돌아왔을 때 스태시가 바뀌었을 수 있다.
         self.rebuild();
         loop {
+            // 백그라운드에서 훑은 최신 목록이 있으면 먼저 반영한다.
+            if let Some(snap) = self.watcher.as_ref().and_then(Watcher::latest) {
+                self.apply_snapshot(snap);
+            }
             terminal.draw(|f| self.draw(f))?;
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -742,8 +918,14 @@ impl Picker {
                         self.mode = Mode::Note(i, cur);
                     }
                 }
+                KeyCode::Backspace | KeyCode::Char('-') => {
+                    self.focus = Focus::List;
+                    self.go_parent();
+                }
                 KeyCode::Enter => {
-                    if !in_preview && self.selected_dir().is_some() {
+                    if !in_preview && self.on_parent_row() {
+                        self.go_parent();
+                    } else if !in_preview && self.selected_dir().is_some() {
                         self.toggle_dir();
                     } else if let Some(exit) = self.open_selected() {
                         return Ok(exit);
@@ -757,6 +939,7 @@ impl Picker {
     // ------------------------------------------------------------ 그리기
 
     fn draw(&mut self, f: &mut Frame) {
+        self.prune_changes();
         let [header, body, footer] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
         self.page = body.height as usize;
 
@@ -814,6 +997,7 @@ impl Picker {
         let dim = Style::default().fg(Color::Indexed(245));
         let name_style = Style::default().fg(Color::Indexed(252));
         let dir_style = Style::default().fg(Color::Indexed(110));
+        let change_style = Style::default().fg(Color::Indexed(110));
         let items: Vec<ListItem> = self
             .rows
             .iter()
@@ -821,13 +1005,22 @@ impl Picker {
                 Row::Dir { path, depth, open, files } => {
                     let name = path.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
                     let mark = if *open { "▾ " } else { "▸ " };
-                    Line::from(vec![
+                    let mut spans = vec![
                         Span::raw("  ".repeat(*depth)),
                         Span::styled(format!("{mark}{name}/"), dir_style),
                         Span::styled(format!("  {files}"), dim),
-                    ])
+                    ];
+                    // 접혀 있어 안이 안 보이는 폴더는, 안에서 무언가 바뀌었음을 점으로 알린다.
+                    if !*open && self.changed.keys().any(|c| c.starts_with(path)) {
+                        spans.push(Span::styled("  ●", change_style));
+                    }
+                    Line::from(spans)
                 }
                 Row::Item { idx, depth } => self.item_line(*idx, *depth, name_style, dim),
+                Row::Parent => {
+                    let up = self.root.parent().map(short).unwrap_or_default();
+                    Line::from(vec![Span::styled("../", dir_style), Span::styled(format!("  {up}"), dim)])
+                }
             })
             .map(ListItem::new)
             .collect();
@@ -853,6 +1046,13 @@ impl Picker {
                     if !dir.is_empty() && dir != "." {
                         spans.push(Span::styled(format!("  {dir}/"), dim));
                     }
+                }
+                if let Some((kind, _)) = self.changed.get(p) {
+                    let label = match kind {
+                        Change::Added => "  ● 새 파일",
+                        Change::Modified => "  ● 변경됨",
+                    };
+                    spans.push(Span::styled(label, Style::default().fg(Color::Indexed(110))));
                 }
                 Line::from(spans)
             }
@@ -894,23 +1094,36 @@ impl Picker {
     /// 선택된 항목의 미리보기 줄. 같은 (경로, 폭)이면 캐시를 쓴다.
     fn preview_lines(&mut self, width: usize) -> &[Line<'static>] {
         let dim = Style::default().fg(Color::Indexed(245));
-        let key = match self.selected_path() {
+        let selected = self.selected_path();
+        let key = match &selected {
             Some(Source::File(p)) => (p.to_string_lossy().into_owned(), width),
-            Some(Source::Url(u)) => (u, width),
+            Some(Source::Url(u)) => (u.clone(), width),
             _ => match self.selected_dir() {
                 Some(d) => (format!("<dir>{}", d.display()), width),
+                None if self.on_parent_row() => (format!("<parent>{}", self.root.display()), width),
                 None => (String::from("<none>"), width),
             },
         };
-        if self.cache.as_ref().is_none_or(|c| c.key != key) {
-            // 다른 문서를 고르면 맨 위부터 보여 준다.
+        // 파일 표식(수정 시각·크기)이 바뀌면 같은 문서라도 다시 그린다.
+        let stamp = match &selected {
+            Some(Source::File(p)) => source::stamp_of(p),
+            _ => None,
+        };
+        let same_doc = self.cache.as_ref().is_some_and(|c| c.key == key);
+        let fresh = same_doc && self.cache.as_ref().is_some_and(|c| c.stamp == stamp);
+        if !fresh {
             let lines = self.render_preview(&key.0, width, dim);
-            self.preview_scroll = 0;
-            self.cache = Some(PreviewCache { key, lines });
+            // 다른 문서를 고르면 맨 위부터. 같은 문서가 고쳐진 것이면 보던 자리를 지킨다.
+            if !same_doc {
+                self.preview_scroll = 0;
+            }
+            self.cache = Some(PreviewCache { key, stamp, lines });
         }
-        let lines = &self.cache.as_ref().unwrap().lines;
-        self.preview_len = lines.len();
-        lines
+        let len = self.cache.as_ref().map_or(0, |c| c.lines.len());
+        self.preview_len = len;
+        // 내용이 짧아졌으면 스크롤을 끝에 맞춘다.
+        self.preview_scroll = self.preview_scroll.min(len.saturating_sub(self.preview_height));
+        &self.cache.as_ref().unwrap().lines
     }
 
     fn render_preview(&self, key: &str, width: usize, dim: Style) -> Vec<Line<'static>> {
@@ -925,6 +1138,10 @@ impl Picker {
         }
         if key == "<none>" {
             return note("선택된 항목이 없습니다");
+        }
+        if let Some(root) = key.strip_prefix("<parent>") {
+            let up = Path::new(root).parent().map(short).unwrap_or_default();
+            return note(&format!("../  — 상위 폴더 {up} 로 이동 (Enter, Backspace, -)"));
         }
         if crate::source::is_url(key) {
             return note("원격 문서입니다. Enter 로 열면 내려받습니다.");
@@ -960,6 +1177,8 @@ impl Picker {
             Mode::Normal => {
                 if let Some((msg, _)) = &self.status {
                     msg.clone()
+                } else if self.scanning {
+                    format!("{} 훑는 중…", short(&self.root))
                 } else if files == 0 {
                     match self.tab {
                         Tab::Local => "no markdown files found  Tab stashed  q quit".to_string(),
@@ -973,7 +1192,7 @@ impl Picker {
                 } else {
                     let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  -/⌫ up  v view  p preview  s stash  / filter  q quit{hint}"),
                         Tab::Stashed => format!("{files} stashed  j/k gg/G  l preview  Enter open  x remove  m note  / filter  Tab local  q quit{hint}"),
                     }
                 }
@@ -988,6 +1207,18 @@ enum Pos {
     Last,
 }
 
+/// 목록이 바뀌어도 커서를 되찾기 위한 표식.
+enum Anchor {
+    Parent,
+    Dir(PathBuf),
+    File(PathBuf),
+}
+
+/// 화면에 보여 줄 짧은 경로(`~` 줄임, 한글 자소 결합).
+fn short(p: &Path) -> String {
+    crate::hangul::compose(&crate::stash::shorten_home(&p.to_string_lossy()))
+}
+
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
@@ -999,7 +1230,7 @@ mod tests {
     fn picker(files: &[&str]) -> Picker {
         let stash = Stash::load_from(std::env::temp_dir().join(format!("mdview-picker-{}.json", std::process::id())));
         Picker::new(
-            PathBuf::from("/tmp/root"),
+            PathBuf::from("/"),
             files.iter().map(PathBuf::from).collect(),
             Rc::new(RefCell::new(stash)),
             Theme::notty(),
@@ -1011,6 +1242,7 @@ mod tests {
         match p.state.selected().and_then(|s| p.rows.get(s)) {
             Some(Row::Dir { path, open, .. }) => format!("{}/{}", path.display(), if *open { "" } else { "(접힘)" }),
             Some(Row::Item { idx, .. }) => p.files[*idx].display().to_string(),
+            Some(Row::Parent) => "../".into(),
             None => "(없음)".into(),
         }
     }
@@ -1332,6 +1564,180 @@ mod tests {
         let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(text.iter().any(|l| l.contains("제목")));
         assert!(text.iter().any(|l| l.contains('━')), "제목 밑줄까지 그려진다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ 상위 폴더 · 자동 갱신
+
+    fn st(secs: u64, len: u64) -> Stamp {
+        (Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs)), len)
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mdview-picker-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 실제 폴더를 훑어 만든 브라우저(감시기 없음).
+    fn picker_at(root: &Path) -> Picker {
+        let scan = crate::source::scan_markdown_files(root);
+        let stash = Stash::load_from(std::env::temp_dir().join(format!("mdview-picker-{}.json", std::process::id())));
+        let mut p = Picker::new(root.to_path_buf(), scan.iter().map(|(f, _)| f.clone()).collect(), Rc::new(RefCell::new(stash)), Theme::notty());
+        p.stamps = scan;
+        p.baseline = true;
+        p
+    }
+
+    /// base/{proj/a.md, proj/sub/b.md, other/c.md, top.md}
+    fn project_tree(name: &str) -> PathBuf {
+        let base = tmp(name);
+        for f in ["proj/a.md", "proj/sub/b.md", "other/c.md", "top.md"] {
+            let path = base.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "# x\n").unwrap();
+        }
+        base
+    }
+
+    #[test]
+    fn parent_row_is_on_top_but_hidden_while_filtering() {
+        let dir = tmp("parentrow");
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        let mut p = picker_at(&dir);
+        assert!(matches!(p.rows[0], Row::Parent));
+        assert_eq!(at(&p), "a.md", "처음 커서는 `../` 가 아니라 첫 파일에 선다");
+        p.filter = "a".into();
+        p.rebuild();
+        assert!(!p.rows.iter().any(|r| matches!(r, Row::Parent)));
+        assert_eq!(at(&p), "a.md", "`../` 가 사라져도 같은 파일을 가리킨다");
+        p.filter.clear();
+        p.rebuild();
+        assert_eq!(at(&p), "a.md", "다시 생겨도 마찬가지");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filesystem_root_has_no_parent_row() {
+        let mut p = picker(&["a.md"]);
+        assert!(!p.rows.iter().any(|r| matches!(r, Row::Parent)));
+        p.go_parent();
+        assert_eq!(p.root, PathBuf::from("/"));
+        assert!(p.status.as_ref().unwrap().0.contains("최상위"));
+    }
+
+    #[test]
+    fn going_up_lands_on_the_folder_we_left_with_siblings_folded() {
+        let base = project_tree("up");
+        let mut p = picker_at(&base.join("proj"));
+        p.collapsed.insert(PathBuf::from("sub"));
+        p.go_parent();
+        assert_eq!(p.root, base);
+        assert_eq!(at(&p), "proj/", "올라오기 전 폴더에 커서가 선다");
+        assert!(p.collapsed.contains(&PathBuf::from("other")), "형제 폴더는 접어 둔다");
+        assert!(!p.collapsed.contains(&PathBuf::from("proj")), "왔던 폴더는 펴 둔다");
+        assert!(p.collapsed.contains(&PathBuf::from("proj/sub")), "접어 둔 하위 폴더는 새 경로로 유지");
+        assert!(p.files.contains(&PathBuf::from("top.md")));
+        assert!(p.changed.is_empty(), "새 루트의 첫 결과는 모두 '새 파일'로 표시하지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn enter_on_parent_row_goes_up() {
+        let base = project_tree("enterup");
+        let mut p = picker_at(&base.join("proj"));
+        p.goto(Pos::First);
+        assert_eq!(at(&p), "../");
+        assert!(p.on_parent_row());
+        p.go_parent();
+        assert_eq!(p.root, base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn going_up_with_the_watcher_scans_in_the_background() {
+        let base = project_tree("upwatch");
+        let proj = base.join("proj");
+        let mut p = picker_at(&proj);
+        p.start_watching(crate::source::scan_markdown_files(&proj));
+        p.go_parent();
+        assert!(p.scanning, "넓은 폴더에서도 화면이 멈추지 않도록 결과를 기다린다");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while p.scanning && Instant::now() < deadline {
+            if let Some(snap) = p.watcher.as_ref().and_then(Watcher::latest) {
+                p.apply_snapshot(snap);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(!p.scanning);
+        assert_eq!(at(&p), "proj/");
+        assert_eq!(p.files.len(), 4);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn snapshot_marks_new_and_changed_files_and_keeps_the_cursor() {
+        let mut p = picker(&["a.md", "b.md"]);
+        p.stamps = vec![(PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(1, 1))];
+        p.baseline = true;
+        p.goto(Pos::Last);
+        assert_eq!(at(&p), "b.md");
+        p.apply_snapshot(Snapshot {
+            root: PathBuf::from("/"),
+            files: vec![(PathBuf::from("0new.md"), st(2, 1)), (PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(3, 9))],
+        });
+        assert_eq!(at(&p), "b.md", "위에 파일이 끼어들어도 보던 파일을 계속 가리킨다");
+        assert_eq!(p.changed.get(Path::new("0new.md")).map(|c| c.0), Some(Change::Added));
+        assert_eq!(p.changed.get(Path::new("b.md")).map(|c| c.0), Some(Change::Modified));
+        assert!(!p.changed.contains_key(Path::new("a.md")));
+        assert_eq!(p.status.as_ref().unwrap().0, "목록 갱신: 추가 1, 변경 1");
+    }
+
+    #[test]
+    fn snapshot_for_an_old_root_is_ignored() {
+        let mut p = picker(&["a.md"]);
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/elsewhere"), files: vec![(PathBuf::from("x.md"), st(1, 1))] });
+        assert_eq!(p.files, vec![PathBuf::from("a.md")]);
+    }
+
+    #[test]
+    fn deleting_the_selected_file_keeps_the_cursor_in_range() {
+        let mut p = picker(&["a.md", "b.md"]);
+        p.stamps = vec![(PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(1, 1))];
+        p.baseline = true;
+        p.goto(Pos::Last);
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), files: vec![(PathBuf::from("a.md"), st(1, 1))] });
+        assert_eq!(at(&p), "a.md");
+        assert_eq!(p.status.as_ref().unwrap().0, "삭제됨: b.md");
+    }
+
+    #[test]
+    fn change_marks_fade_after_a_while() {
+        let mut p = picker(&["a.md", "b.md"]);
+        let old = Instant::now().checked_sub(CHANGE_TTL + Duration::from_secs(1)).unwrap();
+        p.changed.insert(PathBuf::from("a.md"), (Change::Added, old));
+        p.changed.insert(PathBuf::from("b.md"), (Change::Modified, Instant::now()));
+        p.prune_changes();
+        assert!(!p.changed.contains_key(Path::new("a.md")));
+        assert!(p.changed.contains_key(Path::new("b.md")));
+    }
+
+    #[test]
+    fn preview_picks_up_edits_without_losing_the_scroll_position() {
+        let dir = tmp("reload");
+        let file = dir.join("doc.md");
+        let body: String = (1..=40).map(|i| format!("줄 {i}\n\n")).collect();
+        std::fs::write(&file, &body).unwrap();
+        let mut p = picker_at(&dir);
+        assert_eq!(at(&p), "doc.md");
+        p.preview_height = 5;
+        p.preview_lines(40);
+        p.preview_scroll = 6;
+        std::fs::write(&file, format!("{body}추가된 끝 줄\n")).unwrap();
+        let text: Vec<String> = p.preview_lines(40).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(text.iter().any(|l| l.contains("추가된 끝 줄")), "고친 내용이 바로 보인다");
+        assert_eq!(p.preview_scroll, 6, "보던 위치는 그대로");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

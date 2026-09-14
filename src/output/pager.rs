@@ -38,6 +38,8 @@ pub struct Pager {
     /// 스태시에 저장할 식별자. 표준입력 문서는 None.
     stash_key: Option<String>,
     status: Option<(String, Instant)>,
+    /// 파일이 바뀌었으면 새 내용을 채우고 true 를 돌려주는 콜백(파일 문서만)
+    reload: Option<Box<dyn FnMut() -> bool>>,
 }
 
 const STATUS_TTL: Duration = Duration::from_secs(2);
@@ -50,6 +52,7 @@ impl Pager {
         from_picker: bool,
         stash: Rc<RefCell<Stash>>,
         stash_key: Option<String>,
+        reload: Option<Box<dyn FnMut() -> bool>>,
     ) -> Self {
         let lines = rerender(width);
         let rendered = lines.iter().map(tui_convert::line).collect();
@@ -68,6 +71,7 @@ impl Pager {
             stash,
             stash_key,
             status: None,
+            reload,
         }
     }
 
@@ -99,6 +103,17 @@ impl Pager {
             self.rendered = self.lines.iter().map(tui_convert::line).collect();
             self.scroll = self.scroll.min(self.lines.len().saturating_sub(1));
             self.recompute_matches();
+        }
+    }
+
+    /// 보고 있는 파일이 바뀌었으면 다시 그린다. 스크롤 위치와 검색어는 그대로 둔다.
+    fn reload_if_changed(&mut self) {
+        let Some(reload) = self.reload.as_mut() else { return };
+        if reload() {
+            self.lines = (self.rerender)(self.width);
+            self.rendered = self.lines.iter().map(tui_convert::line).collect();
+            self.recompute_matches();
+            self.set_status("파일이 바뀌어 다시 불러왔습니다");
         }
     }
 
@@ -138,6 +153,7 @@ impl Pager {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<PagerExit> {
         loop {
+            self.reload_if_changed();
             terminal.draw(|f| self.draw(f))?;
             if !event::poll(Duration::from_millis(250))? {
                 continue;
