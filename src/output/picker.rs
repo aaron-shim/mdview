@@ -57,6 +57,8 @@ enum Mode {
     Filter,
     /// 스태시 항목 메모 편집 (대상 인덱스, 입력 중인 텍스트)
     Note(usize, String),
+    /// 이동할 폴더 경로 입력
+    GoTo(String),
 }
 
 /// 미리보기로 그려 둔 내용. 같은 (경로, 폭)이면 다시 렌더링하지 않는다.
@@ -113,8 +115,10 @@ pub struct Picker {
     baseline: bool,
     /// 최근에 생기거나 바뀐 파일(루트 기준 상대 경로)
     changed: HashMap<PathBuf, (Change, Instant)>,
-    /// 상위로 올라온 뒤 커서를 둘 폴더 이름
+    /// 상위로 올라온 뒤 커서를 둘 폴더 이름. 새 루트를 다 훑을 때까지 형제 폴더를 접어 두는 기준이기도 하다.
     came_from: Option<PathBuf>,
+    /// 올라온 뒤 그 폴더에 커서를 이미 놓았는지(부분 결과가 올 때마다 다시 옮기지 않는다)
+    landed: bool,
     /// 새 루트를 훑는 중인지
     scanning: bool,
 }
@@ -172,6 +176,7 @@ impl Picker {
             baseline: false,
             changed: HashMap::new(),
             came_from: None,
+            landed: false,
             scanning: false,
         };
         p.rebuild();
@@ -564,36 +569,86 @@ impl Picker {
             return;
         };
         let from = self.root.file_name().map(PathBuf::from);
-        // 접어 두었던 폴더는 새 루트 기준 경로로 옮겨 그대로 유지한다.
-        if let Some(name) = &from {
-            self.collapsed = self.collapsed.iter().map(|p| name.join(p)).collect();
-        }
-        self.root = parent.clone();
+        // 접어 두었던 폴더는 새 루트 기준 경로로 옮겨 그대로 유지하고,
+        // 방금 보던 하위 트리는 새 루트 기준으로 옮겨 훑기가 끝나기 전에 먼저 보여 준다.
+        let seed = match &from {
+            Some(name) => {
+                self.collapsed = self.collapsed.iter().map(|p| name.join(p)).collect();
+                self.files.iter().map(|f| name.join(f)).collect()
+            }
+            None => Vec::new(),
+        };
         self.came_from = from;
+        self.set_status(format!("상위 폴더: {}", short(&parent)));
+        self.set_root(parent, seed);
+    }
+
+    /// 입력한 경로(`Mode::GoTo`)로 루트를 옮긴다. 잘못된 경로면 알리고 입력창은 그대로 둔다.
+    fn go_to(&mut self) {
+        let Mode::GoTo(text) = &self.mode else { return };
+        if self.tab != Tab::Local {
+            self.mode = Mode::Normal;
+            return;
+        }
+        match resolve_dir(&self.root, text) {
+            Ok(dir) => {
+                self.mode = Mode::Normal;
+                self.collapsed.clear();
+                self.came_from = None;
+                self.set_status(format!("이동: {}", short(&dir)));
+                self.set_root(dir, Vec::new());
+            }
+            Err(e) => self.set_status(e),
+        }
+    }
+
+    /// 루트를 바꾸고 목록을 다시 훑는다. 상태 메시지와 `came_from`은 호출한 쪽에서 미리 정한다.
+    /// `seed`는 훑은 결과가 오기 전까지 먼저 보여 줄 목록(새 루트 기준 상대 경로).
+    fn set_root(&mut self, root: PathBuf, seed: Vec<PathBuf>) {
+        self.root = root.clone();
         self.filter.clear();
         self.changed.clear();
         self.baseline = false;
+        self.landed = false;
         self.cache = None;
         self.focus = Focus::List;
-        self.set_status(format!("상위 폴더: {}", short(&parent)));
         match &self.watcher {
             Some(w) => {
                 // 넓은 폴더는 훑는 데 시간이 걸린다. 화면을 멈추지 않고 결과를 기다린다.
-                w.set_root(parent);
-                self.files.clear();
+                w.set_root(root);
+                self.files = seed;
                 self.stamps.clear();
                 self.scanning = true;
                 self.rebuild();
-                self.state.select(Some(0));
+                self.land();
             }
             None => {
-                let files = source::scan_markdown_files(&parent);
-                self.apply_snapshot(Snapshot { root: parent, files });
+                let files = source::scan_markdown_files(&root);
+                self.apply_snapshot(Snapshot { root, files, done: true });
             }
         }
     }
 
+    /// 올라오기 전 폴더(`came_from`)가 목록에 있으면 커서를 그리로 옮긴다. 한 번만.
+    fn land(&mut self) {
+        if self.landed {
+            return;
+        }
+        let Some(from) = &self.came_from else {
+            self.select_first_item();
+            return;
+        };
+        match self.rows.iter().position(|r| matches!(r, Row::Dir { path, .. } if path == from)) {
+            Some(pos) => {
+                self.state.select(Some(pos));
+                self.landed = true;
+            }
+            None => self.select_first_item(),
+        }
+    }
+
     /// 새로 훑은 결과를 목록에 반영한다. 커서는 같은 항목을 계속 가리킨다.
+    /// 부분 결과(`done == false`)면 목록만 채우고 훑는 중 표시는 그대로 둔다.
     fn apply_snapshot(&mut self, snap: Snapshot) {
         // 루트를 바꾸기 전에 출발한 늦은 결과는 버린다.
         if snap.root != self.root {
@@ -618,10 +673,12 @@ impl Picker {
         }
         self.files = snap.files.iter().map(|(p, _)| p.clone()).collect();
         self.stamps = snap.files;
-        self.baseline = true;
-        self.scanning = false;
+        // 완료본이 와야 다음 결과와 비교할 기준이 된다. 부분 결과끼리 비교하면 죄다 '새 파일'이 된다.
+        self.baseline = snap.done;
+        self.scanning = !snap.done;
 
-        if let Some(from) = self.came_from.take() {
+        if let Some(from) = self.came_from.clone() {
+            // 올라온 폴더만 펼치고 형제 폴더는 접어 둔다. 훑기가 끝날 때까지 새로 나타나는 형제도 마찬가지.
             for f in &self.files {
                 if f.components().count() > 1
                     && let Some(top) = f.components().next().map(|c| PathBuf::from(c.as_os_str()))
@@ -631,9 +688,13 @@ impl Picker {
                 }
             }
             self.rebuild();
-            match self.rows.iter().position(|r| matches!(r, Row::Dir { path, .. } if *path == from)) {
-                Some(pos) => self.state.select(Some(pos)),
-                None => self.select_first_item(),
+            if self.landed {
+                self.restore(anchor);
+            } else {
+                self.land();
+            }
+            if snap.done {
+                self.came_from = None;
             }
             return;
         }
@@ -753,6 +814,24 @@ impl Picker {
                         KeyCode::Backspace => {
                             text.pop();
                         }
+                        KeyCode::Char(c) if !ctrl => text.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+                Mode::GoTo(text) => {
+                    match k.code {
+                        KeyCode::Esc => self.mode = Mode::Normal,
+                        KeyCode::Enter => self.go_to(),
+                        KeyCode::Tab => {
+                            if let Some(done) = complete_dir(&self.root, text) {
+                                *text = done;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            text.pop();
+                        }
+                        KeyCode::Char('u') if ctrl => text.clear(),
                         KeyCode::Char(c) if !ctrl => text.push(c),
                         _ => {}
                     }
@@ -907,6 +986,10 @@ impl Picker {
                     self.mode = Mode::Filter;
                 }
                 KeyCode::Char('s') if self.tab == Tab::Local => self.stash_selected(),
+                KeyCode::Char('c') if self.tab == Tab::Local => {
+                    self.focus = Focus::List;
+                    self.mode = Mode::GoTo(String::new());
+                }
                 KeyCode::Char('x') if self.tab == Tab::Stashed => {
                     self.focus = Focus::List;
                     self.remove_selected();
@@ -1174,6 +1257,10 @@ impl Picker {
         let text = match &self.mode {
             Mode::Filter => format!("/{}", self.filter),
             Mode::Note(_, t) => format!("note: {t}▏  (Enter save, Esc cancel)"),
+            Mode::GoTo(t) => match &self.status {
+                Some((msg, _)) => format!("cd: {t}▏  {msg}"),
+                None => format!("cd: {t}▏  (Tab complete, Enter go, Esc cancel)"),
+            },
             Mode::Normal => {
                 if let Some((msg, _)) = &self.status {
                     msg.clone()
@@ -1192,7 +1279,7 @@ impl Picker {
                 } else {
                     let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  -/⌫ up  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  -/⌫ up  c cd  v view  p preview  s stash  / filter  q quit{hint}"),
                         Tab::Stashed => format!("{files} stashed  j/k gg/G  l preview  Enter open  x remove  m note  / filter  Tab local  q quit{hint}"),
                     }
                 }
@@ -1217,6 +1304,66 @@ enum Anchor {
 /// 화면에 보여 줄 짧은 경로(`~` 줄임, 한글 자소 결합).
 fn short(p: &Path) -> String {
     crate::hangul::compose(&crate::stash::shorten_home(&p.to_string_lossy()))
+}
+
+/// 입력한 경로를 폴더로 푼다. `~`는 홈, 상대 경로는 `root` 기준.
+fn resolve_dir(root: &Path, input: &str) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("경로를 입력하세요".into());
+    }
+    let path = expand_tilde(root, input);
+    match path.canonicalize() {
+        Ok(p) if p.is_dir() => Ok(p),
+        Ok(_) => Err(format!("폴더가 아닙니다: {}", short(&path))),
+        Err(_) => Err(format!("없는 경로입니다: {}", short(&path))),
+    }
+}
+
+/// `~`를 홈으로 바꾸고 상대 경로는 `root`에 붙인다.
+fn expand_tilde(root: &Path, input: &str) -> PathBuf {
+    if let Some(rest) = input.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/'))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest.trim_start_matches('/'));
+    }
+    root.join(input)
+}
+
+/// 입력 중인 경로의 마지막 조각을 하위 폴더 이름으로 채운다.
+/// 하나만 맞으면 `/`까지 붙이고, 여럿이면 공통 접두어까지만. 더 채울 것이 없으면 `None`.
+fn complete_dir(root: &Path, input: &str) -> Option<String> {
+    let (head, partial) = match input.rfind('/') {
+        Some(i) => (&input[..=i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let dir = if head.is_empty() { root.to_path_buf() } else { expand_tilde(root, head) };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) || e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(partial) && (partial.starts_with('.') || !n.starts_with('.')))
+        .collect();
+    names.sort();
+    let done = match names.as_slice() {
+        [] => return None,
+        [one] => format!("{one}/"),
+        many => common_prefix(many),
+    };
+    (done != partial).then(|| format!("{head}{done}"))
+}
+
+fn common_prefix(names: &[String]) -> String {
+    let first = &names[0];
+    let len = first
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| names.iter().all(|n| n.get(..end) == first.get(..end)))
+        .last()
+        .unwrap_or(0);
+    first[..len].to_string()
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -1686,6 +1833,7 @@ mod tests {
         p.apply_snapshot(Snapshot {
             root: PathBuf::from("/"),
             files: vec![(PathBuf::from("0new.md"), st(2, 1)), (PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(3, 9))],
+            done: true,
         });
         assert_eq!(at(&p), "b.md", "위에 파일이 끼어들어도 보던 파일을 계속 가리킨다");
         assert_eq!(p.changed.get(Path::new("0new.md")).map(|c| c.0), Some(Change::Added));
@@ -1697,7 +1845,7 @@ mod tests {
     #[test]
     fn snapshot_for_an_old_root_is_ignored() {
         let mut p = picker(&["a.md"]);
-        p.apply_snapshot(Snapshot { root: PathBuf::from("/elsewhere"), files: vec![(PathBuf::from("x.md"), st(1, 1))] });
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/elsewhere"), files: vec![(PathBuf::from("x.md"), st(1, 1))], done: true });
         assert_eq!(p.files, vec![PathBuf::from("a.md")]);
     }
 
@@ -1707,7 +1855,7 @@ mod tests {
         p.stamps = vec![(PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(1, 1))];
         p.baseline = true;
         p.goto(Pos::Last);
-        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), files: vec![(PathBuf::from("a.md"), st(1, 1))] });
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), files: vec![(PathBuf::from("a.md"), st(1, 1))], done: true });
         assert_eq!(at(&p), "a.md");
         assert_eq!(p.status.as_ref().unwrap().0, "삭제됨: b.md");
     }
@@ -1739,5 +1887,157 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("추가된 끝 줄")), "고친 내용이 바로 보인다");
         assert_eq!(p.preview_scroll, 6, "보던 위치는 그대로");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ------------------------------------------------------------ 경로 입력으로 이동
+
+    #[test]
+    fn resolve_dir_takes_absolute_paths_as_is() {
+        let dir = tmp("resolve-abs");
+        assert_eq!(resolve_dir(Path::new("/"), &dir.to_string_lossy()).unwrap(), dir.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_dir_reads_relative_paths_from_the_current_root() {
+        let base = project_tree("resolve-rel");
+        assert_eq!(resolve_dir(&base, "proj/sub").unwrap(), base.join("proj/sub").canonicalize().unwrap());
+        assert_eq!(resolve_dir(&base.join("proj"), "..").unwrap(), base.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_dir_expands_tilde_to_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap()).canonicalize().unwrap();
+        assert_eq!(resolve_dir(Path::new("/"), "~").unwrap(), home);
+        assert_eq!(resolve_dir(Path::new("/"), "~/").unwrap(), home);
+    }
+
+    #[test]
+    fn resolve_dir_rejects_missing_paths_and_files() {
+        let base = project_tree("resolve-bad");
+        assert!(resolve_dir(&base, "nope").unwrap_err().contains("없"), "없는 경로");
+        assert!(resolve_dir(&base, "top.md").unwrap_err().contains("폴더가 아닙니다"), "파일");
+        assert!(resolve_dir(&base, "").is_err(), "빈 입력");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_dir_fills_a_unique_match_and_adds_a_slash() {
+        let base = project_tree("complete-one");
+        assert_eq!(complete_dir(&base, "pr").as_deref(), Some("proj/"));
+        assert_eq!(complete_dir(&base, "proj/s").as_deref(), Some("proj/sub/"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_dir_fills_only_the_common_prefix_when_ambiguous() {
+        let base = tmp("complete-many");
+        std::fs::create_dir_all(base.join("alpha-one")).unwrap();
+        std::fs::create_dir_all(base.join("alpha-two")).unwrap();
+        std::fs::write(base.join("alpha-file.md"), "x").unwrap();
+        assert_eq!(complete_dir(&base, "al").as_deref(), Some("alpha-"), "파일은 후보에서 빼고 공통 접두어까지만");
+        assert_eq!(complete_dir(&base, "alpha-").as_deref(), None, "더 채울 것이 없다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_dir_returns_none_when_nothing_matches() {
+        let base = project_tree("complete-none");
+        assert_eq!(complete_dir(&base, "zzz"), None);
+        assert_eq!(complete_dir(&base, "nope/x"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_dir_keeps_the_typed_prefix_for_absolute_and_tilde_paths() {
+        let base = project_tree("complete-abs");
+        let typed = format!("{}/pr", base.display());
+        assert_eq!(complete_dir(Path::new("/"), &typed).as_deref(), Some(format!("{}/proj/", base.display()).as_str()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn go_to_moves_the_root_and_lists_its_files() {
+        let base = project_tree("goto");
+        let mut p = picker_at(&base);
+        p.collapsed.insert(PathBuf::from("other"));
+        p.mode = Mode::GoTo("proj/sub".into());
+        p.go_to();
+        assert!(matches!(p.mode, Mode::Normal));
+        assert_eq!(p.root, base.join("proj/sub").canonicalize().unwrap());
+        assert!(p.collapsed.is_empty(), "접힘 상태는 새 루트에서 초기화");
+        assert!(p.files.iter().all(|f| f.extension().is_some()), "새 루트의 파일만 보인다");
+        assert!(!p.files.contains(&PathBuf::from("top.md")));
+        assert!(p.status.as_ref().unwrap().0.contains("sub"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn go_to_a_bad_path_reports_and_keeps_the_prompt_open() {
+        let base = project_tree("goto-bad");
+        let mut p = picker_at(&base);
+        p.mode = Mode::GoTo("nope".into());
+        p.go_to();
+        assert!(matches!(&p.mode, Mode::GoTo(t) if t == "nope"), "입력창은 그대로");
+        assert_eq!(p.root, base);
+        assert!(p.status.as_ref().unwrap().0.contains("없"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn go_to_is_ignored_on_the_stashed_tab() {
+        let base = project_tree("goto-stash");
+        let mut p = picker_at(&base);
+        p.tab = Tab::Stashed;
+        p.mode = Mode::GoTo("proj".into());
+        p.go_to();
+        assert_eq!(p.root, base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ------------------------------------------------------------ 부분 스냅숏 · 즉시 표시
+
+    #[test]
+    fn partial_snapshots_fill_the_list_but_keep_scanning() {
+        let base = project_tree("partial");
+        let mut p = picker_at(&base.join("proj"));
+        p.start_watching(crate::source::scan_markdown_files(&base.join("proj")));
+        p.go_parent();
+        assert!(p.scanning);
+        p.apply_snapshot(Snapshot { root: base.clone(), files: vec![(PathBuf::from("top.md"), st(1, 1))], done: false });
+        assert!(p.scanning, "부분 결과로는 훑기가 끝나지 않는다");
+        assert!(p.files.contains(&PathBuf::from("top.md")), "부분 결과도 바로 보인다");
+        p.apply_snapshot(Snapshot { root: base.clone(), files: crate::source::scan_markdown_files(&base), done: true });
+        assert!(!p.scanning);
+        assert_eq!(p.files.len(), 4);
+        assert!(p.changed.is_empty(), "새 루트의 첫 결과는 변경 표시를 붙이지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn going_up_shows_the_subtree_we_came_from_before_the_scan_returns() {
+        let base = project_tree("seed");
+        let proj = base.join("proj");
+        let mut p = picker_at(&proj);
+        p.start_watching(crate::source::scan_markdown_files(&proj));
+        p.go_parent();
+        assert!(p.scanning);
+        assert_eq!(p.files, vec![PathBuf::from("proj/a.md"), PathBuf::from("proj/sub/b.md")], "이미 알던 하위 트리는 즉시 보여 준다");
+        assert_eq!(at(&p), "proj/", "커서는 올라오기 전 폴더에");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cursor_lands_on_the_folder_we_left_even_when_it_arrives_in_a_partial_snapshot() {
+        let base = project_tree("seed-partial");
+        let mut p = picker_at(&base.join("proj"));
+        p.start_watching(crate::source::scan_markdown_files(&base.join("proj")));
+        p.go_parent();
+        p.apply_snapshot(Snapshot { root: base.clone(), files: vec![(PathBuf::from("other/c.md"), st(1, 1)), (PathBuf::from("proj/a.md"), st(1, 1))], done: false });
+        assert_eq!(at(&p), "proj/");
+        assert!(p.collapsed.contains(&PathBuf::from("other")));
+        p.apply_snapshot(Snapshot { root: base.clone(), files: crate::source::scan_markdown_files(&base), done: true });
+        assert_eq!(at(&p), "proj/", "완료본이 와도 커서는 그대로");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

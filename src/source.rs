@@ -4,7 +4,7 @@ use crate::hangul;
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -143,26 +143,53 @@ pub fn stamp_of(path: &Path) -> Option<Stamp> {
 /// 다른 파일 시스템(`/proc`, 네트워크 마운트 등)으로는 내려가지 않는다.
 /// 상위 폴더로 올라가며 넓은 범위를 훑을 때 엉뚱한 곳까지 뒤지지 않게 하려는 것이다.
 pub fn scan_markdown_files(root: &Path) -> Vec<(PathBuf, Stamp)> {
-    let mut files: Vec<(PathBuf, Stamp)> = ignore::WalkBuilder::new(root)
-        .hidden(true)
-        .max_depth(Some(6))
-        .same_file_system(true)
-        .build()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter(|e| is_markdown(e.path()))
-        .map(|e| {
+    scan_markdown_files_with(root, |_| true).unwrap_or_default()
+}
+
+/// 중간 보고를 넣는 간격: 파일이 이만큼 더 모였을 때, 또는 `PROGRESS_INTERVAL`이 지났을 때.
+pub(crate) const PROGRESS_EVERY: usize = 64;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+/// 시계를 보는 빈도(항목 수). 매 항목마다 보지 않아도 충분히 촘촘하다.
+const CLOCK_EVERY: usize = 64;
+
+/// `scan_markdown_files`와 같되, 훑는 도중 `tick`에 지금까지 모은(정렬된) 목록을 넘긴다.
+/// `tick`이 `false`를 돌려주면 그 자리에서 멈추고 `None`.
+/// 넓은 폴더에서 화면을 먼저 채우거나 훑기를 취소할 때 쓴다.
+pub fn scan_markdown_files_with(root: &Path, mut tick: impl FnMut(&[(PathBuf, Stamp)]) -> bool) -> Option<Vec<(PathBuf, Stamp)>> {
+    let mut files: Vec<(PathBuf, Stamp)> = Vec::new();
+    let mut reported = 0;
+    let mut visited = 0usize;
+    let mut last_tick = Instant::now();
+    let walk = ignore::WalkBuilder::new(root).hidden(true).max_depth(Some(6)).same_file_system(true).build();
+    for e in walk.filter_map(|e| e.ok()) {
+        if e.file_type().is_some_and(|t| t.is_file()) && is_markdown(e.path()) {
             let stamp = e.metadata().map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0));
             let rel = e.path().strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| e.path().to_path_buf());
-            (rel, stamp)
-        })
-        .collect();
+            files.push((rel, stamp));
+        }
+        visited += 1;
+        let due = files.len() - reported >= PROGRESS_EVERY || (visited.is_multiple_of(CLOCK_EVERY) && last_tick.elapsed() >= PROGRESS_INTERVAL);
+        if due {
+            let mut snap = files.clone();
+            sort_files(&mut snap);
+            if !tick(&snap) {
+                return None;
+            }
+            reported = files.len();
+            last_tick = Instant::now();
+        }
+    }
+    sort_files(&mut files);
+    Some(files)
+}
+
+/// 얕은 것부터, 같은 깊이면 경로순.
+pub(crate) fn sort_files(files: &mut [(PathBuf, Stamp)]) {
     files.sort_by(|(a, _), (b, _)| {
         let da = a.components().count();
         let db = b.components().count();
         da.cmp(&db).then_with(|| a.cmp(b))
     });
-    files
 }
 
 #[cfg(test)]
@@ -217,5 +244,59 @@ mod tests {
         assert_eq!(u.stash_key().as_deref(), Some("https://a.b/c.md"));
         assert_eq!(Source::from_stash_key("https://a.b/c.md"), u);
         assert_eq!(Source::from_stash_key("/tmp/a.md"), Source::File(PathBuf::from("/tmp/a.md")));
+    }
+
+    fn many_files(name: &str, n: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mdview-scan-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(if i % 2 == 0 { "" } else { "sub" }).join(format!("f{i:04}.md")), "x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn scan_reports_progress_before_it_finishes() {
+        let dir = many_files("progress", PROGRESS_EVERY * 3 + 5);
+        let mut seen = Vec::new();
+        let all = scan_markdown_files_with(&dir, |partial| {
+            seen.push(partial.len());
+            true
+        })
+        .expect("취소하지 않았으니 결과가 있다");
+        assert_eq!(all.len(), PROGRESS_EVERY * 3 + 5);
+        assert!(seen.len() >= 3, "중간 보고가 여러 번 온다: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "보고할 때마다 목록이 줄지 않는다: {seen:?}");
+        assert!(seen.iter().any(|&n| n < all.len()), "완료 전에 보고한다: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_stops_when_the_callback_says_so() {
+        let dir = many_files("cancel", PROGRESS_EVERY * 3);
+        let mut calls = 0;
+        let out = scan_markdown_files_with(&dir, |_| {
+            calls += 1;
+            false
+        });
+        assert!(out.is_none(), "취소하면 결과를 돌려주지 않는다");
+        assert_eq!(calls, 1, "첫 보고에서 바로 멈춘다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_lists_are_sorted_like_the_final_one() {
+        let dir = many_files("sorted", PROGRESS_EVERY + 1);
+        let mut first = None;
+        scan_markdown_files_with(&dir, |partial| {
+            first.get_or_insert_with(|| partial.to_vec());
+            true
+        });
+        let first = first.unwrap();
+        let mut sorted = first.clone();
+        sort_files(&mut sorted);
+        assert_eq!(first, sorted);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 pub struct Snapshot {
     pub root: PathBuf,
     pub files: Vec<(PathBuf, Stamp)>,
+    /// `false`면 아직 훑는 중에 보낸 부분 결과. 루트를 막 바꿨을 때만 온다.
+    pub done: bool,
 }
 
 /// 두 스냅숏 사이의 차이. 경로는 루트 기준 상대 경로.
@@ -122,23 +124,51 @@ impl Watcher {
 fn run(mut root: PathBuf, initial: Vec<(PathBuf, Stamp)>, ctrl: Receiver<PathBuf>, tx: Sender<Snapshot>) {
     let mut last: Option<Vec<(PathBuf, Stamp)>> = Some(initial);
     let mut wait = MIN_INTERVAL;
+    // 훑는 도중 들어온 새 루트. 쉬지 않고 바로 그쪽을 훑는다.
+    let mut pending: Option<PathBuf> = None;
     loop {
-        match ctrl.recv_timeout(wait) {
-            Ok(new_root) => {
-                // 루트가 바뀌면 비교 기준도 버리고 즉시 훑는다.
-                root = new_root;
-                last = None;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            // Watcher 가 사라지면 스레드도 끝낸다.
-            Err(RecvTimeoutError::Disconnected) => return,
+        let newest = match pending.take() {
+            Some(r) => Some(r),
+            None => match ctrl.recv_timeout(wait) {
+                Ok(r) => Some(r),
+                Err(RecvTimeoutError::Timeout) => None,
+                // Watcher 가 사라지면 스레드도 끝낸다.
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+        };
+        // 연달아 바뀐 루트는 마지막 것만 훑는다.
+        let newest = ctrl.try_iter().last().or(newest);
+        if let Some(r) = newest {
+            root = r;
+            last = None;
         }
+        // 루트를 막 바꿨을 때는 화면이 비어 있으니 모이는 대로 부분 결과를 보낸다.
+        let fresh = last.is_none();
+        let mut sent = 0;
+        let mut gone = false;
         let started = Instant::now();
-        let files = source::scan_markdown_files(&root);
+        let files = source::scan_markdown_files_with(&root, |partial| {
+            if let Some(r) = ctrl.try_iter().last() {
+                pending = Some(r);
+                return false;
+            }
+            if fresh && partial.len() > sent {
+                sent = partial.len();
+                if tx.send(Snapshot { root: root.clone(), files: partial.to_vec(), done: false }).is_err() {
+                    gone = true;
+                    return false;
+                }
+            }
+            true
+        });
+        if gone {
+            return;
+        }
+        let Some(files) = files else { continue };
         wait = next_interval(started.elapsed());
         if last.as_ref() != Some(&files) {
             last = Some(files.clone());
-            if tx.send(Snapshot { root: root.clone(), files }).is_err() {
+            if tx.send(Snapshot { root: root.clone(), files, done: true }).is_err() {
                 return;
             }
         }
@@ -241,5 +271,70 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         None
+    }
+
+    fn big_dir(name: &str, n: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mdview-watch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i:04}.md")), "x").unwrap();
+        }
+        dir
+    }
+
+    /// `latest`와 달리 온 순서대로 모두 모은다.
+    fn collect(w: &Watcher, until: impl Fn(&[Snapshot]) -> bool, limit: Duration) -> Vec<Snapshot> {
+        let deadline = Instant::now() + limit;
+        let mut got = Vec::new();
+        while Instant::now() < deadline && !until(&got) {
+            while let Ok(s) = w.rx.try_recv() {
+                got.push(s);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        got
+    }
+
+    #[test]
+    fn a_new_root_streams_partial_snapshots_before_the_final_one() {
+        let big = big_dir("stream", source::PROGRESS_EVERY * 3 + 1);
+        let small = big_dir("stream-small", 1);
+        let w = Watcher::spawn(small.clone(), source::scan_markdown_files(&small));
+        w.set_root(big.clone());
+        let got = collect(&w, |g| g.iter().any(|s| s.root == big && s.done), Duration::from_secs(6));
+        let partials: Vec<_> = got.iter().filter(|s| s.root == big && !s.done).collect();
+        let last = got.iter().rfind(|s| s.root == big && s.done).expect("완료 스냅숏이 온다");
+        assert!(!partials.is_empty(), "완료 전에 부분 스냅숏이 먼저 온다");
+        assert!(partials.iter().all(|p| p.files.len() < last.files.len()));
+        assert_eq!(last.files.len(), source::PROGRESS_EVERY * 3 + 1);
+        let _ = std::fs::remove_dir_all(&big);
+        let _ = std::fs::remove_dir_all(&small);
+    }
+
+    #[test]
+    fn a_newer_root_cancels_the_scan_of_the_previous_one() {
+        let a = big_dir("stale-a", 3000);
+        let b = big_dir("stale-b", 2);
+        let start = big_dir("stale-start", 1);
+        let w = Watcher::spawn(start.clone(), source::scan_markdown_files(&start));
+        w.set_root(a.clone());
+        w.set_root(b.clone());
+        let got = collect(&w, |g| g.iter().any(|s| s.root == b && s.done), Duration::from_secs(6));
+        assert!(got.iter().any(|s| s.root == b && s.done), "마지막 루트의 완료 스냅숏이 온다");
+        assert!(!got.iter().any(|s| s.root == a && s.done), "취소된 루트의 완료 스냅숏은 오지 않는다");
+        for d in [&a, &b, &start] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn routine_rescans_send_only_complete_snapshots() {
+        let dir = big_dir("routine", source::PROGRESS_EVERY * 2 + 1);
+        let w = Watcher::spawn(dir.clone(), source::scan_markdown_files(&dir));
+        std::fs::write(dir.join("new.md"), "x").unwrap();
+        let got = collect(&w, |g| g.iter().any(|s| s.done), Duration::from_secs(6));
+        assert!(got.iter().all(|s| s.done), "같은 루트를 다시 훑을 때는 완료본만 보낸다");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
