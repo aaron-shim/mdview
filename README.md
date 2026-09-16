@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.4_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.5_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -63,6 +63,7 @@ mdview -P README.md         # 페이저 없이 그대로 출력
 cat README.md | mdview      # 표준입력에서 읽기 (파이프면 자동으로 그대로 출력)
 mdview                      # 현재 디렉터리의 마크다운 파일 브라우저
 mdview docs/                # 특정 디렉터리 브라우저
+mdview -a                   # 숨김 파일·폴더까지 포함한 브라우저
 mdview github.com/charmbracelet/glow          # GitHub 저장소 README
 mdview https://github.com/o/r/blob/main/a.md  # GitHub 파일 (raw로 자동 변환)
 mdview https://example.com/doc.md             # 임의 URL
@@ -84,6 +85,7 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 | `-s, --style <auto\|dark\|light\|notty>` | 색 테마 (기본 auto: TTY면 dark, `COLORFGBG`로 밝은 배경 감지) |
 | `-w, --width <N>` | 줄바꿈 폭 (기본: 터미널 폭, 최대 120) |
 | `--no-color` | 색 비활성화 (`NO_COLOR` 환경변수도 지원) |
+| `-a, --hidden` (`--all`) | 파일 브라우저에 숨김 파일·폴더도 표시 (브라우저 안에서는 `.` 키) |
 
 환경변수: `MDVIEW_STYLE=dark|light|notty|auto` (`-s`를 안 줬을 때의 기본 테마),
 `NO_COLOR`, `MDVIEW_STASH`(스태시 파일 위치). macOS 터미널은 배경색을 알려주지 않으므로,
@@ -121,6 +123,7 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 | `c` | 경로를 입력해 폴더 이동 (`Tab` 자동 완성, `~`·상대 경로 가능) |
 | `v` | 목록 보기 전환 (트리 ↔ 평면) |
 | `p` | 미리보기 창 켜기 / 끄기 |
+| `.` | 숨김 파일·폴더 표시 켜기 / 끄기 |
 | `/` | 이름 필터 (필터 중에는 접힌 디렉터리도 펼쳐 보여 줍니다) |
 | `Tab`, `1` / `2` | Local ↔ Stashed 탭 전환 |
 | `s` | (Local 탭) 선택한 파일을 스태시에 저장 |
@@ -142,7 +145,7 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
      markdown-sample.md                    │   glow 와 같은 터미널 마크다운 뷰어를
      sample.md                             │   Rust 로 구현한다.
    README.md                               │
- 5 files  j/k gg/G ^d^u^f^b  l preview  Enter open  v view  p preview  s stash  / filter  q quit
+ 5 files  j/k gg/G ^d^u^f^b  l preview  Enter open  v view  p preview  . hidden  s stash  / filter  q quit
 ```
 
 미리보기는 선택한 문서를 실제 렌더러로 그리므로 수식·표·다이어그램까지 그대로 보입니다.
@@ -192,8 +195,19 @@ mdview --no-color a.md      # 색 없이 출력 (파이프 시 자동)
 작은 폴더는 1초마다, 훑는 데 오래 걸리는 넓은 폴더는 최대 15초 간격으로 스스로 늦춥니다.
 다른 파일 시스템(`/proc`, 네트워크 마운트 등)으로는 내려가지 않습니다.
 
-Local 탭은 `.gitignore`와 숨김 파일을 제외하고 하위 디렉터리까지 찾습니다.
+Local 탭은 `.gitignore`와 숨김 파일을 기본으로 제외하고 하위 디렉터리까지 찾습니다(숨김은 `.`로 켤 수 있습니다).
 트리 보기가 기본이며, `v`로 경로를 한 줄씩 나열하는 평면 보기로 바꿀 수 있습니다.
+
+### 숨김 파일·폴더 (0.3.5)
+
+`.`을 누르면 `.`으로 시작하는 파일과 폴더(`.github/`, `.claude/`, `.notes/` 등)를 목록에 넣고 뺍니다.
+`mdview -a`(`--hidden`, `--all`)로 처음부터 켜 둔 채 시작할 수도 있습니다.
+
+- 켜 두면 헤더에 `·숨김`, 푸터의 `. hidden`에 `✓`가 붙습니다.
+- 숨김 파일과 폴더는 이름을 흐리게 그려 보통 항목과 구별합니다.
+- 켤 때는 보던 목록을 그대로 둔 채 백그라운드로 다시 훑고, 끌 때는 기다리지 않고 바로 감춥니다.
+  어느 쪽이든 커서는 보던 항목을 계속 가리키고, 이때 늘거나 준 파일에는 변경 표시를 붙이지 않습니다.
+- `.gitignore`는 숨김을 켜도 그대로 존중하며, 저장소 내부인 `.git/`에는 들어가지 않습니다.
 
 ## 스태시 (로컬 즐겨찾기)
 

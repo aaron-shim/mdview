@@ -2,7 +2,8 @@
 //!
 //! 목록은 평면/트리 두 가지로 볼 수 있고(`v`), 오른쪽에 미리보기 창을 붙일 수
 //! 있다(`p`). 이동은 vi 키(j/k, Ctrl-d/u/f/b, gg, G)를 따르고, 트리는 h/l 로
-//! 접고 편다(H/L 은 전체). 미리보기 창 폭은 구분선을 마우스로 끌어 바꾼다.
+//! 접고 편다(H/L 은 전체). 숨김 파일·폴더는 `.` 로 켜고 끈다.
+//! 미리보기 창 폭은 구분선을 마우스로 끌어 바꾼다.
 
 use crate::output::tree::{self, Row};
 use crate::output::tui_convert;
@@ -121,6 +122,8 @@ pub struct Picker {
     landed: bool,
     /// 새 루트를 훑는 중인지
     scanning: bool,
+    /// `.`으로 시작하는 파일·폴더도 목록에 넣을지
+    hidden: bool,
 }
 
 pub enum PickerExit {
@@ -143,7 +146,7 @@ const MIN_PREVIEW_COLS: u16 = 30;
 const CHANGE_TTL: Duration = Duration::from_secs(30);
 
 impl Picker {
-    pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>, theme: Theme) -> Self {
+    pub fn new(root: PathBuf, files: Vec<PathBuf>, stash: Rc<RefCell<Stash>>, theme: Theme, hidden: bool) -> Self {
         let mut p = Picker {
             root,
             files,
@@ -178,6 +181,7 @@ impl Picker {
             came_from: None,
             landed: false,
             scanning: false,
+            hidden,
         };
         p.rebuild();
         p.select_first_item();
@@ -550,7 +554,7 @@ impl Picker {
 
     /// 백그라운드에서 루트를 다시 훑어 목록을 자동으로 갱신한다. `scan`은 이미 보여 준 목록.
     pub fn start_watching(&mut self, scan: Vec<(PathBuf, Stamp)>) {
-        self.watcher = Some(Watcher::spawn(self.root.clone(), scan.clone()));
+        self.watcher = Some(Watcher::spawn(self.root.clone(), self.hidden, scan.clone()));
         self.stamps = scan;
         self.baseline = true;
     }
@@ -602,6 +606,46 @@ impl Picker {
         }
     }
 
+    /// `.`: 숨김 파일·폴더를 목록에 넣고 뺀다.
+    ///
+    /// 끌 때는 지금 목록에서 숨김 경로를 바로 걷어 내 곧장 반응하고, 켤 때는 보던 목록을 그대로 둔 채
+    /// 새로 훑은 결과를 기다린다. 어느 쪽이든 커서는 보던 항목을 계속 가리킨다.
+    fn toggle_hidden(&mut self) {
+        if self.tab != Tab::Local {
+            self.set_status("숨김 파일 표시는 Local 탭에서만 쓸 수 있습니다");
+            return;
+        }
+        self.hidden = !self.hidden;
+        if !self.hidden {
+            let anchor = self.anchor();
+            self.files.retain(|p| !source::is_hidden_path(p));
+            self.stamps.retain(|(p, _)| !source::is_hidden_path(p));
+            self.changed.retain(|p, _| !source::is_hidden_path(p));
+            self.collapsed.retain(|d| !source::is_hidden_path(d));
+            self.rebuild();
+            self.restore(anchor);
+        }
+        self.set_status(if self.hidden { "숨김 파일 표시" } else { "숨김 파일 감춤" });
+        self.rescan();
+    }
+
+    /// 루트는 그대로 두고 지금 설정으로 다시 훑는다.
+    fn rescan(&mut self) {
+        // 설정이 바뀌어 늘거나 준 파일을 '새 파일'·'삭제됨'으로 알리지 않도록 비교 기준을 버린다.
+        self.baseline = false;
+        match &self.watcher {
+            Some(w) => {
+                w.request(self.root.clone(), self.hidden);
+                self.scanning = true;
+            }
+            None => {
+                let root = self.root.clone();
+                let files = source::scan_markdown_files(&root, self.hidden);
+                self.apply_snapshot(Snapshot { root, hidden: self.hidden, files, done: true });
+            }
+        }
+    }
+
     /// 루트를 바꾸고 목록을 다시 훑는다. 상태 메시지와 `came_from`은 호출한 쪽에서 미리 정한다.
     /// `seed`는 훑은 결과가 오기 전까지 먼저 보여 줄 목록(새 루트 기준 상대 경로).
     fn set_root(&mut self, root: PathBuf, seed: Vec<PathBuf>) {
@@ -615,7 +659,7 @@ impl Picker {
         match &self.watcher {
             Some(w) => {
                 // 넓은 폴더는 훑는 데 시간이 걸린다. 화면을 멈추지 않고 결과를 기다린다.
-                w.set_root(root);
+                w.request(root, self.hidden);
                 self.files = seed;
                 self.stamps.clear();
                 self.scanning = true;
@@ -623,8 +667,8 @@ impl Picker {
                 self.land();
             }
             None => {
-                let files = source::scan_markdown_files(&root);
-                self.apply_snapshot(Snapshot { root, files, done: true });
+                let files = source::scan_markdown_files(&root, self.hidden);
+                self.apply_snapshot(Snapshot { root, hidden: self.hidden, files, done: true });
             }
         }
     }
@@ -650,8 +694,8 @@ impl Picker {
     /// 새로 훑은 결과를 목록에 반영한다. 커서는 같은 항목을 계속 가리킨다.
     /// 부분 결과(`done == false`)면 목록만 채우고 훑는 중 표시는 그대로 둔다.
     fn apply_snapshot(&mut self, snap: Snapshot) {
-        // 루트를 바꾸기 전에 출발한 늦은 결과는 버린다.
-        if snap.root != self.root {
+        // 루트나 숨김 설정을 바꾸기 전에 출발한 늦은 결과는 버린다.
+        if snap.root != self.root || snap.hidden != self.hidden {
             return;
         }
         let anchor = self.anchor();
@@ -953,6 +997,10 @@ impl Picker {
                     self.focus = Focus::List;
                     self.toggle_view();
                 }
+                KeyCode::Char('.') => {
+                    self.focus = Focus::List;
+                    self.toggle_hidden();
+                }
                 KeyCode::Char('p') => {
                     self.preview = !self.preview;
                     if !self.preview {
@@ -1065,15 +1113,19 @@ impl Picker {
         } else {
             String::new()
         };
-        let title = Line::from(vec![
+        let mut spans = vec![
             Span::styled(" mdview ", Style::default().fg(Color::Indexed(231)).bg(Color::Indexed(24)).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled("Local", tab_style(self.tab == Tab::Local)),
             Span::raw("   "),
             Span::styled(format!("Stashed ({n_stash})"), tab_style(self.tab == Tab::Stashed)),
             Span::styled(format!("   {where_}"), Style::default().fg(Color::Indexed(245))),
-        ]);
-        f.render_widget(Paragraph::new(title), area);
+        ];
+        // 숨김을 켜 두면 목록이 왜 늘었는지 헤더에서 바로 알 수 있게 한다.
+        if self.hidden && self.tab == Tab::Local {
+            spans.push(Span::styled("  ·숨김", Style::default().fg(Color::Indexed(109))));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1088,9 +1140,11 @@ impl Picker {
                 Row::Dir { path, depth, open, files } => {
                     let name = path.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
                     let mark = if *open { "▾ " } else { "▸ " };
+                    // 숨김 폴더는 흐리게 그려 보통 폴더와 구별한다.
+                    let style = if name.starts_with('.') { dir_style.add_modifier(Modifier::DIM) } else { dir_style };
                     let mut spans = vec![
                         Span::raw("  ".repeat(*depth)),
-                        Span::styled(format!("{mark}{name}/"), dir_style),
+                        Span::styled(format!("{mark}{name}/"), style),
                         Span::styled(format!("  {files}"), dim),
                     ];
                     // 접혀 있어 안이 안 보이는 폴더는, 안에서 무언가 바뀌었음을 점으로 알린다.
@@ -1122,7 +1176,9 @@ impl Picker {
             Tab::Local => {
                 let p = &self.files[idx];
                 let name = p.file_name().map(|n| crate::hangul::compose(&n.to_string_lossy())).unwrap_or_default();
-                let mut spans = vec![Span::raw("  ".repeat(depth)), Span::styled(name, name_style)];
+                // 숨김 파일과 숨김 폴더 안의 파일은 흐리게 그려 보통 파일과 구별한다.
+                let style = if source::is_hidden_path(p) { name_style.add_modifier(Modifier::DIM) } else { name_style };
+                let mut spans = vec![Span::raw("  ".repeat(depth)), Span::styled(name, style)];
                 // 평면 보기에서는 어느 디렉터리인지 뒤에 덧붙인다.
                 if self.view == View::Flat {
                     let dir = p.parent().map(|d| crate::hangul::compose(&d.to_string_lossy())).unwrap_or_default();
@@ -1279,7 +1335,10 @@ impl Picker {
                 } else {
                     let hint = if self.preview && !show_preview { "  (창이 좁아 미리보기 접힘)" } else { "" };
                     match self.tab {
-                        Tab::Local => format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  -/⌫ up  c cd  v view  p preview  s stash  / filter  q quit{hint}"),
+                        Tab::Local => {
+                            let on = if self.hidden { " ✓" } else { "" };
+                            format!("{files} files  j/k gg/G  h/l fold·preview  H/L fold all  Enter open  -/⌫ up  c cd  v view  p preview  . hidden{on}  s stash  / filter  q quit{hint}")
+                        }
                         Tab::Stashed => format!("{files} stashed  j/k gg/G  l preview  Enter open  x remove  m note  / filter  Tab local  q quit{hint}"),
                     }
                 }
@@ -1376,12 +1435,7 @@ mod tests {
 
     fn picker(files: &[&str]) -> Picker {
         let stash = Stash::load_from(std::env::temp_dir().join(format!("mdview-picker-{}.json", std::process::id())));
-        Picker::new(
-            PathBuf::from("/"),
-            files.iter().map(PathBuf::from).collect(),
-            Rc::new(RefCell::new(stash)),
-            Theme::notty(),
-        )
+        Picker::new(PathBuf::from("/"), files.iter().map(PathBuf::from).collect(), Rc::new(RefCell::new(stash)), Theme::notty(), false)
     }
 
     /// 선택된 행을 사람이 읽을 수 있는 형태로.
@@ -1729,9 +1783,9 @@ mod tests {
 
     /// 실제 폴더를 훑어 만든 브라우저(감시기 없음).
     fn picker_at(root: &Path) -> Picker {
-        let scan = crate::source::scan_markdown_files(root);
+        let scan = crate::source::scan_markdown_files(root, false);
         let stash = Stash::load_from(std::env::temp_dir().join(format!("mdview-picker-{}.json", std::process::id())));
-        let mut p = Picker::new(root.to_path_buf(), scan.iter().map(|(f, _)| f.clone()).collect(), Rc::new(RefCell::new(stash)), Theme::notty());
+        let mut p = Picker::new(root.to_path_buf(), scan.iter().map(|(f, _)| f.clone()).collect(), Rc::new(RefCell::new(stash)), Theme::notty(), false);
         p.stamps = scan;
         p.baseline = true;
         p
@@ -1807,7 +1861,7 @@ mod tests {
         let base = project_tree("upwatch");
         let proj = base.join("proj");
         let mut p = picker_at(&proj);
-        p.start_watching(crate::source::scan_markdown_files(&proj));
+        p.start_watching(crate::source::scan_markdown_files(&proj, false));
         p.go_parent();
         assert!(p.scanning, "넓은 폴더에서도 화면이 멈추지 않도록 결과를 기다린다");
         let deadline = Instant::now() + Duration::from_secs(6);
@@ -1823,6 +1877,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ------------------------------------------------------------ 숨김 파일
+
+    /// {a.md, .secret.md, .notes/n.md}
+    fn hidden_tree(name: &str) -> PathBuf {
+        let dir = tmp(name);
+        std::fs::create_dir_all(dir.join(".notes")).unwrap();
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        std::fs::write(dir.join(".secret.md"), "# s").unwrap();
+        std::fs::write(dir.join(".notes/n.md"), "# n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn dot_key_shows_and_hides_dot_files_and_folders() {
+        let dir = hidden_tree("hidden");
+        let mut p = picker_at(&dir);
+        assert_eq!(p.files, vec![PathBuf::from("a.md")], "기본은 숨김을 빼고 보여 준다");
+
+        p.toggle_hidden();
+        assert!(p.hidden);
+        assert!(p.files.contains(&PathBuf::from(".secret.md")), "숨김 파일이 나온다");
+        assert!(p.files.contains(&PathBuf::from(".notes/n.md")), "숨김 폴더 안까지 나온다");
+        assert!(p.rows.iter().any(|r| matches!(r, Row::Dir { path, .. } if path == Path::new(".notes"))), "숨김 폴더도 트리에 선다");
+        assert_eq!(at(&p), "a.md", "커서는 보던 파일을 계속 가리킨다");
+        assert!(p.changed.is_empty(), "숨김을 켜서 늘어난 파일을 '새 파일'로 표시하지 않는다");
+
+        p.toggle_hidden();
+        assert!(!p.hidden);
+        assert_eq!(p.files, vec![PathBuf::from("a.md")]);
+        assert!(p.changed.is_empty(), "감출 때도 '삭제됨'으로 표시하지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turning_hidden_off_takes_effect_before_the_rescan_lands() {
+        let dir = hidden_tree("hiddenoff");
+        let mut p = picker_at(&dir);
+        p.toggle_hidden();
+        p.collapsed.insert(PathBuf::from(".notes"));
+        // 감시기가 있으면 다시 훑는 동안 결과를 기다린다. 그 사이에도 숨김 경로는 바로 걷어 낸다.
+        p.start_watching(p.stamps.clone());
+        p.toggle_hidden();
+        assert!(!p.files.iter().any(|f| crate::source::is_hidden_path(f)), "다시 훑기를 기다리지 않고 바로 감춘다");
+        assert!(p.collapsed.is_empty(), "사라진 폴더의 접힘 상태도 함께 지운다");
+        assert!(p.scanning, "실제 목록은 백그라운드에서 다시 훑어 맞춘다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshots_made_with_the_other_hidden_setting_are_dropped() {
+        let mut p = picker(&["a.md"]);
+        p.hidden = true;
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), hidden: false, files: vec![(PathBuf::from("b.md"), st(1, 1))], done: true });
+        assert_eq!(p.files, vec![PathBuf::from("a.md")], "설정을 바꾸기 전에 출발한 결과는 버린다");
+    }
+
+    #[test]
+    fn hidden_names_are_drawn_dim() {
+        let p = picker(&[".secret.md", "a.md"]);
+        let style = |i| p.item_line(i, 0, Style::default().fg(Color::Indexed(252)), Style::default()).spans[1].style;
+        assert!(style(0).add_modifier.contains(Modifier::DIM), "숨김 파일은 흐리게");
+        assert!(!style(1).add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn hidden_toggle_is_local_only() {
+        let mut p = picker(&["a.md"]);
+        p.switch_tab(Tab::Stashed);
+        p.toggle_hidden();
+        assert!(!p.hidden);
+        assert!(p.status.as_ref().unwrap().0.contains("Local"));
+    }
+
     #[test]
     fn snapshot_marks_new_and_changed_files_and_keeps_the_cursor() {
         let mut p = picker(&["a.md", "b.md"]);
@@ -1832,6 +1959,7 @@ mod tests {
         assert_eq!(at(&p), "b.md");
         p.apply_snapshot(Snapshot {
             root: PathBuf::from("/"),
+            hidden: false,
             files: vec![(PathBuf::from("0new.md"), st(2, 1)), (PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(3, 9))],
             done: true,
         });
@@ -1845,7 +1973,7 @@ mod tests {
     #[test]
     fn snapshot_for_an_old_root_is_ignored() {
         let mut p = picker(&["a.md"]);
-        p.apply_snapshot(Snapshot { root: PathBuf::from("/elsewhere"), files: vec![(PathBuf::from("x.md"), st(1, 1))], done: true });
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/elsewhere"), hidden: false, files: vec![(PathBuf::from("x.md"), st(1, 1))], done: true });
         assert_eq!(p.files, vec![PathBuf::from("a.md")]);
     }
 
@@ -1855,7 +1983,7 @@ mod tests {
         p.stamps = vec![(PathBuf::from("a.md"), st(1, 1)), (PathBuf::from("b.md"), st(1, 1))];
         p.baseline = true;
         p.goto(Pos::Last);
-        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), files: vec![(PathBuf::from("a.md"), st(1, 1))], done: true });
+        p.apply_snapshot(Snapshot { root: PathBuf::from("/"), hidden: false, files: vec![(PathBuf::from("a.md"), st(1, 1))], done: true });
         assert_eq!(at(&p), "a.md");
         assert_eq!(p.status.as_ref().unwrap().0, "삭제됨: b.md");
     }
@@ -2001,13 +2129,13 @@ mod tests {
     fn partial_snapshots_fill_the_list_but_keep_scanning() {
         let base = project_tree("partial");
         let mut p = picker_at(&base.join("proj"));
-        p.start_watching(crate::source::scan_markdown_files(&base.join("proj")));
+        p.start_watching(crate::source::scan_markdown_files(&base.join("proj"), false));
         p.go_parent();
         assert!(p.scanning);
-        p.apply_snapshot(Snapshot { root: base.clone(), files: vec![(PathBuf::from("top.md"), st(1, 1))], done: false });
+        p.apply_snapshot(Snapshot { root: base.clone(), hidden: false, files: vec![(PathBuf::from("top.md"), st(1, 1))], done: false });
         assert!(p.scanning, "부분 결과로는 훑기가 끝나지 않는다");
         assert!(p.files.contains(&PathBuf::from("top.md")), "부분 결과도 바로 보인다");
-        p.apply_snapshot(Snapshot { root: base.clone(), files: crate::source::scan_markdown_files(&base), done: true });
+        p.apply_snapshot(Snapshot { root: base.clone(), hidden: false, files: crate::source::scan_markdown_files(&base, false), done: true });
         assert!(!p.scanning);
         assert_eq!(p.files.len(), 4);
         assert!(p.changed.is_empty(), "새 루트의 첫 결과는 변경 표시를 붙이지 않는다");
@@ -2019,7 +2147,7 @@ mod tests {
         let base = project_tree("seed");
         let proj = base.join("proj");
         let mut p = picker_at(&proj);
-        p.start_watching(crate::source::scan_markdown_files(&proj));
+        p.start_watching(crate::source::scan_markdown_files(&proj, false));
         p.go_parent();
         assert!(p.scanning);
         assert_eq!(p.files, vec![PathBuf::from("proj/a.md"), PathBuf::from("proj/sub/b.md")], "이미 알던 하위 트리는 즉시 보여 준다");
@@ -2031,12 +2159,12 @@ mod tests {
     fn cursor_lands_on_the_folder_we_left_even_when_it_arrives_in_a_partial_snapshot() {
         let base = project_tree("seed-partial");
         let mut p = picker_at(&base.join("proj"));
-        p.start_watching(crate::source::scan_markdown_files(&base.join("proj")));
+        p.start_watching(crate::source::scan_markdown_files(&base.join("proj"), false));
         p.go_parent();
-        p.apply_snapshot(Snapshot { root: base.clone(), files: vec![(PathBuf::from("other/c.md"), st(1, 1)), (PathBuf::from("proj/a.md"), st(1, 1))], done: false });
+        p.apply_snapshot(Snapshot { root: base.clone(), hidden: false, files: vec![(PathBuf::from("other/c.md"), st(1, 1)), (PathBuf::from("proj/a.md"), st(1, 1))], done: false });
         assert_eq!(at(&p), "proj/");
         assert!(p.collapsed.contains(&PathBuf::from("other")));
-        p.apply_snapshot(Snapshot { root: base.clone(), files: crate::source::scan_markdown_files(&base), done: true });
+        p.apply_snapshot(Snapshot { root: base.clone(), hidden: false, files: crate::source::scan_markdown_files(&base, false), done: true });
         assert_eq!(at(&p), "proj/", "완료본이 와도 커서는 그대로");
         let _ = std::fs::remove_dir_all(&base);
     }

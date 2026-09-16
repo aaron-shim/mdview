@@ -140,10 +140,17 @@ pub fn stamp_of(path: &Path) -> Option<Stamp> {
 /// `root` 아래의 마크다운 파일을 .gitignore를 존중하며 찾는다. 결과는 root 기준 상대 경로이며,
 /// 변경 감지에 쓸 표식을 함께 돌려준다.
 ///
+/// `hidden`이 참이면 `.`으로 시작하는 파일·폴더까지 훑는다. 저장소 내부(`.git`)는 어느 쪽이든 들어가지 않는다.
+///
 /// 다른 파일 시스템(`/proc`, 네트워크 마운트 등)으로는 내려가지 않는다.
 /// 상위 폴더로 올라가며 넓은 범위를 훑을 때 엉뚱한 곳까지 뒤지지 않게 하려는 것이다.
-pub fn scan_markdown_files(root: &Path) -> Vec<(PathBuf, Stamp)> {
-    scan_markdown_files_with(root, |_| true).unwrap_or_default()
+pub fn scan_markdown_files(root: &Path, hidden: bool) -> Vec<(PathBuf, Stamp)> {
+    scan_markdown_files_with(root, hidden, |_| true).unwrap_or_default()
+}
+
+/// 경로에 `.`으로 시작하는 조각이 있는지: 숨김 파일이거나 숨김 폴더 안에 있는지.
+pub fn is_hidden_path(path: &Path) -> bool {
+    path.iter().any(|c| c.to_string_lossy().starts_with('.'))
 }
 
 /// 중간 보고를 넣는 간격: 파일이 이만큼 더 모였을 때, 또는 `PROGRESS_INTERVAL`이 지났을 때.
@@ -155,12 +162,13 @@ const CLOCK_EVERY: usize = 64;
 /// `scan_markdown_files`와 같되, 훑는 도중 `tick`에 지금까지 모은(정렬된) 목록을 넘긴다.
 /// `tick`이 `false`를 돌려주면 그 자리에서 멈추고 `None`.
 /// 넓은 폴더에서 화면을 먼저 채우거나 훑기를 취소할 때 쓴다.
-pub fn scan_markdown_files_with(root: &Path, mut tick: impl FnMut(&[(PathBuf, Stamp)]) -> bool) -> Option<Vec<(PathBuf, Stamp)>> {
+pub fn scan_markdown_files_with(root: &Path, hidden: bool, mut tick: impl FnMut(&[(PathBuf, Stamp)]) -> bool) -> Option<Vec<(PathBuf, Stamp)>> {
     let mut files: Vec<(PathBuf, Stamp)> = Vec::new();
     let mut reported = 0;
     let mut visited = 0usize;
     let mut last_tick = Instant::now();
-    let walk = ignore::WalkBuilder::new(root).hidden(true).max_depth(Some(6)).same_file_system(true).build();
+    // `.git` 안은 문서가 아니라 저장소 데이터다. 숨김을 켜도 들어가지 않는다.
+    let walk = ignore::WalkBuilder::new(root).hidden(!hidden).max_depth(Some(6)).same_file_system(true).filter_entry(|e| e.depth() == 0 || e.file_name() != ".git").build();
     for e in walk.filter_map(|e| e.ok()) {
         if e.file_type().is_some_and(|t| t.is_file()) && is_markdown(e.path()) {
             let stamp = e.metadata().map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0));
@@ -213,9 +221,37 @@ mod tests {
         std::fs::write(dir.join("b.md"), "x").unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         std::fs::write(dir.join("sub/c.markdown"), "x").unwrap();
-        let files: Vec<PathBuf> = scan_markdown_files(&dir).into_iter().map(|(p, _)| p).collect();
+        let files: Vec<PathBuf> = scan_markdown_files(&dir, false).into_iter().map(|(p, _)| p).collect();
         assert_eq!(files, vec![PathBuf::from("b.md"), PathBuf::from("sub/c.markdown")]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_files_and_folders_are_found_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("mdview-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".github")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("a.md"), "x").unwrap();
+        std::fs::write(dir.join(".secret.md"), "x").unwrap();
+        std::fs::write(dir.join(".github/PULL_REQUEST_TEMPLATE.md"), "x").unwrap();
+        std::fs::write(dir.join(".git/inside.md"), "x").unwrap();
+
+        let plain: Vec<PathBuf> = scan_markdown_files(&dir, false).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(plain, vec![PathBuf::from("a.md")]);
+
+        let all: Vec<PathBuf> = scan_markdown_files(&dir, true).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(all, vec![PathBuf::from(".secret.md"), PathBuf::from("a.md"), PathBuf::from(".github/PULL_REQUEST_TEMPLATE.md")]);
+        assert!(!all.iter().any(|p| p.starts_with(".git/")), ".git 안은 숨김을 켜도 들어가지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_paths_are_recognised_at_any_depth() {
+        assert!(is_hidden_path(Path::new(".a.md")));
+        assert!(is_hidden_path(Path::new(".github/a.md")));
+        assert!(is_hidden_path(Path::new("docs/.draft/a.md")));
+        assert!(!is_hidden_path(Path::new("docs/a.md")));
     }
 
     #[test]
@@ -260,7 +296,7 @@ mod tests {
     fn scan_reports_progress_before_it_finishes() {
         let dir = many_files("progress", PROGRESS_EVERY * 3 + 5);
         let mut seen = Vec::new();
-        let all = scan_markdown_files_with(&dir, |partial| {
+        let all = scan_markdown_files_with(&dir, false, |partial| {
             seen.push(partial.len());
             true
         })
@@ -276,7 +312,7 @@ mod tests {
     fn scan_stops_when_the_callback_says_so() {
         let dir = many_files("cancel", PROGRESS_EVERY * 3);
         let mut calls = 0;
-        let out = scan_markdown_files_with(&dir, |_| {
+        let out = scan_markdown_files_with(&dir, false, |_| {
             calls += 1;
             false
         });
@@ -289,7 +325,7 @@ mod tests {
     fn progress_lists_are_sorted_like_the_final_one() {
         let dir = many_files("sorted", PROGRESS_EVERY + 1);
         let mut first = None;
-        scan_markdown_files_with(&dir, |partial| {
+        scan_markdown_files_with(&dir, false, |partial| {
             first.get_or_insert_with(|| partial.to_vec());
             true
         });

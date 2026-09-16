@@ -262,9 +262,9 @@ fn browse(cli: &Cli, theme: Theme, root: PathBuf, stash: Rc<RefCell<Stash>>) -> 
         bail!("no input given and stdout is not a terminal (try: mdview FILE.md)");
     }
     let root = root.canonicalize().unwrap_or(root);
-    let scan = source::scan_markdown_files(&root);
+    let scan = source::scan_markdown_files(&root, cli.hidden);
     let files = scan.iter().map(|(p, _)| p.clone()).collect();
-    let mut picker = Picker::new(root, files, stash.clone(), theme.clone());
+    let mut picker = Picker::new(root, files, stash.clone(), theme.clone(), cli.hidden);
     // 파일이 생기거나 바뀌면 목록과 미리보기를 자동으로 갱신한다.
     picker.start_watching(scan);
     // 페이저와 브라우저를 오갈 때 터미널을 한 번만 초기화한다.

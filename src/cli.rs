@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Show hidden files and directories (dot files) in the file browser.
+    #[arg(short = 'a', long, visible_alias = "all")]
+    pub hidden: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
