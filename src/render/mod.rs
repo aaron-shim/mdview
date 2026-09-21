@@ -326,7 +326,7 @@ impl<'t> Renderer<'t> {
                 None => {
                     let st = self.theme.image;
                     let mut l = Line::from_spans(vec![Span::new("🖼 ", st)]);
-                    l.push(Span::new(format!("({src})"), st.merge(self.theme.link_url)));
+                    l.push(Span::new(format!("({})", image::display_src(src)), st.merge(self.theme.link_url)));
                     out.push(HtmlPart::Line(l));
                 }
             }
@@ -690,7 +690,7 @@ impl<'t> Renderer<'t> {
                 self.pop_style();
                 if let Some(url) = self.image_url.take() {
                     let st = self.style().merge(self.theme.link_url);
-                    self.inline.push(Span::new(format!(" ({url})"), st));
+                    self.inline.push(Span::new(format!(" ({})", image::display_src(&url)), st));
                 }
             }
             TagEnd::FootnoteDefinition => {

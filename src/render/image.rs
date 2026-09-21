@@ -73,12 +73,17 @@ fn sixel_cache() -> &'static SixelCache {
 enum Loc {
     File(PathBuf),
     Url(String),
+    /// 문서에 박힌 `data:` URI를 풀어 둔 바이트
+    Data(Vec<u8>),
 }
 
 fn resolve(src: &str, base: &ImageBase) -> Option<Loc> {
     let src = src.trim();
-    if src.is_empty() || src.starts_with("data:") || src.starts_with('#') {
+    if src.is_empty() || src.starts_with('#') {
         return None;
+    }
+    if let Some(rest) = src.strip_prefix("data:") {
+        return data_uri(rest).map(Loc::Data);
     }
     if crate::source::is_url(src) {
         // github.com/.../blob/... 은 HTML 페이지이므로 raw 주소로 바꾼다.
@@ -101,6 +106,51 @@ fn resolve(src: &str, base: &ImageBase) -> Option<Loc> {
         }
         ImageBase::Url(u) => Some(Loc::Url(join_url(u, src))),
     }
+}
+
+/// `data:[<형식>][;base64],<내용>`의 `data:` 뒤를 풀어 바이트로. base64만 받는다.
+fn data_uri(rest: &str) -> Option<Vec<u8>> {
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    let bytes = base64_decode(payload)?;
+    (bytes.len() as u64 <= MAX_BYTES).then_some(bytes)
+}
+
+/// 표준 base64(`+/`, URL용 `-_`도 허용)를 푼다. 공백·줄바꿈과 끝의 `=`는 건너뛴다.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\t' | b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// 화면에 보일 이미지 주소. 문서에 박힌 `data:` URI는 길어서 형식과 크기로 줄인다.
+pub fn display_src(src: &str) -> String {
+    let Some(rest) = src.trim().strip_prefix("data:") else { return src.to_string() };
+    let (meta, payload) = rest.split_once(',').unwrap_or((rest, ""));
+    let mime = meta.split(';').next().filter(|m| !m.is_empty()).unwrap_or("data");
+    let bytes = if meta.contains(";base64") { payload.trim_end_matches('=').len() * 3 / 4 } else { payload.len() };
+    let size = if bytes >= 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) } else { format!("{bytes} B") };
+    format!("data:{mime}, {size}")
 }
 
 /// 기준 URL에 상대 주소를 잇는다.
@@ -138,6 +188,13 @@ fn cache_key(loc: &Loc) -> String {
         // 파일이 바뀌면 다시 읽도록 수정 시각·크기를 키에 넣는다.
         Loc::File(p) => format!("{}\0{:?}", p.display(), crate::source::stamp_of(p)),
         Loc::Url(u) => u.clone(),
+        // 내용 자체가 곧 이미지이므로 내용의 해시를 키로 쓴다.
+        Loc::Data(b) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            b.hash(&mut h);
+            format!("data:{:016x}:{}", h.finish(), b.len())
+        }
     }
 }
 
@@ -163,6 +220,7 @@ fn load_keyed(loc: &Loc) -> Option<(String, Arc<RgbaImage>)> {
 
 fn read_bytes(loc: &Loc) -> Option<Vec<u8>> {
     match loc {
+        Loc::Data(b) => Some(b.clone()),
         Loc::File(p) => {
             if std::fs::metadata(p).ok()?.len() > MAX_BYTES {
                 return None;
@@ -348,7 +406,24 @@ mod tests {
             resolve("https://github.com/o/r/blob/main/a.png", &base),
             Some(Loc::Url("https://raw.githubusercontent.com/o/r/main/a.png".into()))
         );
-        assert_eq!(resolve("data:image/png;base64,xx", &base), None);
+        // base64로 박힌 이미지는 풀어서 쓴다. base64가 아니면 건너뛴다.
+        assert_eq!(resolve("data:image/png;base64,aGk=", &base), Some(Loc::Data(b"hi".to_vec())));
+        assert_eq!(resolve("data:text/plain,hi", &base), None);
+    }
+
+    #[test]
+    fn shortens_data_uris_for_display() {
+        assert_eq!(display_src("a.png"), "a.png");
+        assert_eq!(display_src("data:image/png;base64,aGVsbG8gd29ybGQ="), "data:image/png, 11 B");
+        assert_eq!(display_src(&format!("data:image/gif;base64,{}", "A".repeat(4096))), "data:image/gif, 3.0 KB");
+    }
+
+    #[test]
+    fn decodes_base64() {
+        assert_eq!(base64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello", "줄바꿈은 건너뛴다");
+        assert_eq!(base64_decode("-_8").unwrap(), [0xfb, 0xff], "URL용 문자도 받는다");
+        assert!(base64_decode("a*b").is_none());
     }
 
     #[test]

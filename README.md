@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.7_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.8_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -252,6 +252,7 @@ st-flexipatch라면 `patches.h`의 `SIXEL_PATCH`를 1로, `config.mk`의 `SIXEL_
 (imlib2 필요) 다시 빌드하면 됩니다.
 
 - PNG, JPEG, GIF(첫 장), WebP, BMP. SVG는 그리지 않고 설명만 보입니다.
+- 문서에 박힌 `data:image/...;base64,...` 이미지도 그립니다. 설명 줄에는 `(data:image/png, 1.4 KB)`처럼 줄여 보입니다.
 - 상대 경로는 문서 파일이 있는 폴더(원격 문서면 그 URL, 표준입력이면 현재 폴더) 기준으로 찾습니다.
   원격 이미지는 5초 안에 내려받지 못하면 설명만 보입니다.
 - 문장 속 이미지(배지 등)와 색 없는 출력(`--no-color`, 파이프)은 예전처럼 설명만 보입니다.
