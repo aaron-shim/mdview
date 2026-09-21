@@ -3,14 +3,16 @@
 pub mod canvas;
 pub mod code;
 pub mod html_table;
+pub mod image;
 pub mod math;
 pub mod mermaid;
 pub mod table;
 
 use crate::doc::{Line, Span, Style};
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeKind};
 use crate::wrap::wrap_line;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use image::ImageBase;
 use table::Table;
 
 /// 블록 접두(들여쓰기, 인용 막대, 목록 기호).
@@ -66,6 +68,19 @@ struct Renderer<'t> {
     footnotes: Vec<(String, Vec<Line>)>,
     /// 각주 본문을 잡아두는 동안 잠시 치워둔 (출력, 접두)
     saved: Option<(Vec<Line>, Vec<Prefix>)>,
+    /// 이미지를 찾을 기준. None이면 이미지를 그리지 않고 대체 글만 보인다.
+    image_base: Option<ImageBase>,
+    /// 이미지를 그릴 최대 줄 수
+    image_rows: usize,
+    /// 지금 문단에 나온 이미지 주소. 문단이 이미지 하나뿐이면 그림으로 그린다.
+    para_image: Option<String>,
+    /// 지금 문단에 이미지 말고 다른 내용이 있는지
+    para_extra: bool,
+}
+
+/// 이미지 한 장이 차지할 수 있는 최대 줄 수: 터미널 높이에서 조금 뺀 만큼.
+fn image_rows() -> usize {
+    crossterm::terminal::size().ok().map(|(_, h)| h as usize).filter(|h| *h > 0).map_or(40, |h| h.saturating_sub(4).max(8))
 }
 
 /// 평문 한 줄을 폭에 맞춰 나눈다.
@@ -73,8 +88,15 @@ pub fn wrap_plain(s: &str, width: usize) -> Vec<String> {
     wrap_line(&Line::from_spans(vec![Span::raw(s)]), width).iter().map(Line::plain).collect()
 }
 
-/// 마크다운 문자열을 `width` 폭에 맞춘 스타일 줄들로 렌더링한다.
+/// 마크다운 문자열을 `width` 폭에 맞춘 스타일 줄들로 렌더링한다. 이미지는 대체 글로만 보인다.
+#[cfg(test)]
 pub fn render(markdown: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    render_doc(markdown, theme, width, None)
+}
+
+/// `render`와 같되, `images`가 있으면 홀로 선 이미지를 그림으로 그린다.
+/// 색이 없는 테마에서는 그리지 않는다.
+pub fn render_doc(markdown: &str, theme: &Theme, width: usize, images: Option<&ImageBase>) -> Vec<Line> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -105,6 +127,10 @@ pub fn render(markdown: &str, theme: &Theme, width: usize) -> Vec<Line> {
         skip_depth: 0,
         footnotes: Vec::new(),
         saved: None,
+        image_base: images.filter(|_| theme.kind != ThemeKind::NoTty).cloned(),
+        image_rows: image_rows(),
+        para_image: None,
+        para_extra: false,
     };
     for ev in parser {
         r.event(ev);
@@ -221,6 +247,40 @@ impl<'t> Renderer<'t> {
         }
     }
 
+    /// 이미지를 읽어 그린 줄들. 그릴 수 없으면 None.
+    fn picture(&self, src: &str) -> Option<Vec<Line>> {
+        let base = self.image_base.as_ref()?;
+        image::render(src, base, self.avail(), self.image_rows)
+    }
+
+    /// 이미지만 담은 HTML 블록(`<p align="center"><img src=...></p>` 등)을 그린다.
+    /// 글이 섞였거나 하나도 그리지 못하면 None.
+    fn html_pictures(&self, html: &str) -> Option<Vec<Line>> {
+        self.image_base.as_ref()?;
+        let srcs = image::html_img_srcs(html);
+        if srcs.is_empty() || !image::html_has_no_text(html) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for src in &srcs {
+            match self.picture(src) {
+                Some(pic) => {
+                    if !out.is_empty() {
+                        out.push(Line::new());
+                    }
+                    out.extend(pic);
+                }
+                None => {
+                    let st = self.theme.image;
+                    let mut l = Line::from_spans(vec![Span::new("🖼 ", st)]);
+                    l.push(Span::new(format!("({src})"), st.merge(self.theme.link_url)));
+                    out.push(l);
+                }
+            }
+        }
+        out.iter().any(|l| !l.plain().starts_with("🖼")).then_some(out)
+    }
+
     fn heading_level(level: HeadingLevel) -> usize {
         match level {
             HeadingLevel::H1 => 1,
@@ -248,14 +308,19 @@ impl<'t> Renderer<'t> {
                 if let Some((_, buf)) = self.code.as_mut() {
                     buf.push_str(&t);
                 } else {
+                    if self.image_url.is_none() && !t.trim().is_empty() {
+                        self.para_extra = true;
+                    }
                     self.text(&t);
                 }
             }
             Event::Code(t) => {
+                self.para_extra = true;
                 let st = self.style().merge(self.theme.code);
                 self.inline.push(Span::new(format!(" {t} "), st));
             }
             Event::InlineMath(t) => {
+                self.para_extra = true;
                 let st = self.style().merge(self.theme.math);
                 self.inline.push(Span::new(math::render_inline(&t), st));
             }
@@ -289,6 +354,7 @@ impl<'t> Renderer<'t> {
                     self.hard_break();
                     return;
                 }
+                self.para_extra = true;
                 let st = self.style().merge(self.theme.html);
                 self.inline.push(Span::new(h.to_string(), st));
             }
@@ -302,6 +368,7 @@ impl<'t> Renderer<'t> {
                 self.need_blank = true;
             }
             Event::FootnoteReference(name) => {
+                self.para_extra = true;
                 let st = self.style().merge(self.theme.link_url);
                 self.inline.push(Span::new(format!("[{name}]"), st));
             }
@@ -324,6 +391,8 @@ impl<'t> Renderer<'t> {
         match tag {
             Tag::Paragraph => {
                 self.flush_inline();
+                self.para_image = None;
+                self.para_extra = false;
                 if self.prefixes.last().is_some_and(|p| p.is_item)
                     && let Some(l) = self.lists.last_mut() {
                         l.loose = true;
@@ -412,6 +481,10 @@ impl<'t> Renderer<'t> {
                 self.push_style(self.theme.link);
             }
             Tag::Image { dest_url, .. } => {
+                if self.para_image.is_some() {
+                    self.para_extra = true;
+                }
+                self.para_image = Some(dest_url.to_string());
                 self.image_url = Some(dest_url.to_string());
                 self.push_style(self.theme.image);
                 let st = self.style();
@@ -449,6 +522,16 @@ impl<'t> Renderer<'t> {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => {
+                if let Some(src) = self.para_image.take()
+                    && !self.para_extra
+                    && let Some(pic) = self.picture(&src)
+                {
+                    // 대체 글과 주소는 그림 아래 설명으로 남긴다.
+                    self.blank_if_needed();
+                    for l in pic {
+                        self.emit(l);
+                    }
+                }
                 self.flush_inline();
                 self.need_blank = true;
             }
@@ -575,8 +658,8 @@ impl<'t> Renderer<'t> {
             TagEnd::HtmlBlock => {
                 if let Some(buf) = self.html_block.take() {
                     self.blank_if_needed();
-                    // `<table>` 이면 표로 그리고, 아니면 원문을 그대로 보여준다.
-                    match html_table::render(&buf, self.theme, self.avail()) {
+                    // `<table>` 이면 표로, 이미지만 있으면 그림으로 그리고, 아니면 원문을 그대로 보여준다.
+                    match html_table::render(&buf, self.theme, self.avail()).or_else(|| self.html_pictures(&buf)) {
                         Some(lines) => {
                             for l in lines {
                                 self.emit(l);
@@ -713,6 +796,23 @@ mod tests {
     #[test]
     fn image_shows_alt_and_url() {
         assert_eq!(plain("![alt](x.png)", 80), vec!["🖼 alt (x.png)"]);
+    }
+
+    #[test]
+    fn standalone_image_is_drawn() {
+        let dir = std::env::temp_dir().join(format!("mdview-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ::image::RgbaImage::from_pixel(8, 4, ::image::Rgba([255, 0, 0, 255])).save(dir.join("a.png")).unwrap();
+        let base = ImageBase::Dir(dir.clone());
+        let out: Vec<String> = render_doc("![alt](a.png)", &Theme::dark(), 80, Some(&base)).iter().map(|l| l.plain().trim_start().to_string()).collect();
+        assert_eq!(out, vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀", "🖼 alt (a.png)"], "그림 아래에 대체 글이 남는다");
+        // 글 속 이미지와 없는 파일, 색 없는 테마는 대체 글만 보인다.
+        assert_eq!(render_doc("see ![alt](a.png)", &Theme::dark(), 80, Some(&base)).len(), 1);
+        assert_eq!(render_doc("![alt](none.png)", &Theme::dark(), 80, Some(&base)).len(), 1);
+        assert_eq!(render_doc("![alt](a.png)", &Theme::notty(), 80, Some(&base)).len(), 1);
+        let html: Vec<String> = render_doc("<p align=\"center\"><img src=\"a.png\"></p>", &Theme::dark(), 80, Some(&base)).iter().map(|l| l.plain().trim_start().to_string()).collect();
+        assert_eq!(html, vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

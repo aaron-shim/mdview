@@ -1,6 +1,6 @@
 [package]
 name = "mdview"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 # let-chains(`if let ... && ...`)를 쓰므로 1.88 이상이 필요하다.
 rust-version = "1.88"
@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
 ignore = "0.4.33"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 pulldown-cmark = "0.13.4"
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }

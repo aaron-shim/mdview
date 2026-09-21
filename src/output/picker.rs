@@ -1297,7 +1297,8 @@ impl Picker {
             return note("읽을 수 없습니다");
         };
         let text = crate::hangul::compose(&String::from_utf8_lossy(&bytes));
-        let mut out: Vec<Line<'static>> = crate::render::render(&text, &self.theme, width).iter().map(tui_convert::line).collect();
+        let images = crate::render::image::ImageBase::Dir(path.parent().map(Path::to_path_buf).unwrap_or_default());
+        let mut out: Vec<Line<'static>> = crate::render::render_doc(&text, &self.theme, width, Some(&images)).iter().map(tui_convert::line).collect();
         if out.is_empty() {
             out = note("(빈 문서)");
         }

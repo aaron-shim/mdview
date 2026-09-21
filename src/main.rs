@@ -185,7 +185,8 @@ fn stash_command(args: &StashArgs) -> Result<()> {
 
 fn print_document(cli: &Cli, theme: &Theme, doc: &Document) -> Result<()> {
     let width = content_width(cli);
-    let lines = render::render(&doc.text, theme, width);
+    let images = image_base(&doc.source);
+    let lines = render::render_doc(&doc.text, theme, width, Some(&images));
     let mut s = output::ansi::to_string(&lines);
     if !s.is_empty() {
         s.insert(0, '\n');
@@ -231,12 +232,23 @@ fn open_pager(
     };
     let theme = theme.clone();
     let fixed_width = cli.width;
+    let images = image_base(&doc.source);
     let rerender = Box::new(move |term_w: usize| {
         let w = if fixed_width > 0 { fixed_width.min(term_w) } else { term_w.min(MAX_WIDTH) };
-        render::render(&text.borrow(), &theme, w)
+        render::render_doc(&text.borrow(), &theme, w, Some(&images))
     });
     let mut pager = Pager::new(doc.title, terminal_width(), rerender, from_picker, stash, doc.source.stash_key(), reload);
     pager.run(terminal)
+}
+
+/// 문서 안 상대 경로 이미지를 찾을 기준: 파일은 그 폴더, 원격은 내려받은 URL, 표준입력은 현재 폴더.
+fn image_base(src: &Source) -> render::image::ImageBase {
+    use render::image::ImageBase;
+    match src {
+        Source::File(p) => ImageBase::Dir(p.parent().map(Path::to_path_buf).unwrap_or_default()),
+        Source::Url(u) => ImageBase::Url(source::normalize_url(u)),
+        Source::Stdin => ImageBase::Dir(PathBuf::from(".")),
+    }
 }
 
 /// 파일이 바뀌었는지 살피는 콜백. 바뀌었으면 `text`를 새 내용으로 채우고 true.

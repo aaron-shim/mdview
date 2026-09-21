@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.5_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.6_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -236,6 +236,18 @@ mdview 색 확인
 
 세 번째 제목
 ```
+
+### 이미지 (0.3.6)
+
+문단에 이미지 하나만 있으면(`![설명](그림.png)`, 또는 `<p align="center"><img src="..."></p>` 처럼
+이미지만 담은 HTML) 반블록 문자(`▀`)와 트루컬러로 그림을 그리고, 아래에 `🖼 설명 (주소)`를 남깁니다.
+그래픽 프로토콜이 필요 없어 st 같은 터미널에서도 보이며, 페이저·미리보기·`-P` 출력 모두 같습니다.
+
+- PNG, JPEG, GIF(첫 장), WebP, BMP. SVG는 그리지 않고 설명만 보입니다.
+- 상대 경로는 문서 파일이 있는 폴더(원격 문서면 그 URL, 표준입력이면 현재 폴더) 기준으로 찾습니다.
+  원격 이미지는 5초 안에 내려받지 못하면 설명만 보입니다.
+- 문장 속 이미지(배지 등)와 색 없는 출력(`--no-color`, 파이프)은 예전처럼 설명만 보입니다.
+- 폭은 본문 폭에 맞추되 원본보다 키우지 않고, 높이는 터미널 높이를 넘지 않게 줄입니다.
 
 macOS에서 자소가 나뉜 채 저장된 한글(`한글`)은 화면에 나올 때 음절로 합칩니다. 파일 브라우저의
 Local·Stashed 목록(파일 이름·디렉터리·메모·이름 필터)과 페이저 제목, 문서 내용에 모두 적용됩니다.
