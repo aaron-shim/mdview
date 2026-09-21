@@ -5,7 +5,7 @@
 # 원격 저장소에 올린 뒤에는 source=() 를 git+URL 이나 릴리스 tarball 로 바꾸면 됩니다.
 
 pkgname=mdview
-pkgver=0.3.6
+pkgver=0.3.7
 pkgrel=1
 pkgdesc="Terminal markdown viewer like glow, written in Rust (LaTeX math, mermaid diagrams, merged HTML tables, pager, file browser, stash, remote URLs)"
 arch=('x86_64' 'aarch64')

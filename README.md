@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.6_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.7_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -237,11 +237,19 @@ mdview 색 확인
 세 번째 제목
 ```
 
-### 이미지 (0.3.6)
+### 이미지 (0.3.6, sixel 0.3.7)
 
 문단에 이미지 하나만 있으면(`![설명](그림.png)`, 또는 `<p align="center"><img src="..."></p>` 처럼
-이미지만 담은 HTML) 반블록 문자(`▀`)와 트루컬러로 그림을 그리고, 아래에 `🖼 설명 (주소)`를 남깁니다.
-그래픽 프로토콜이 필요 없어 st 같은 터미널에서도 보이며, 페이저·미리보기·`-P` 출력 모두 같습니다.
+이미지만 담은 HTML) 그림을 그리고, 아래에 `🖼 설명 (주소)`를 남깁니다.
+
+- **sixel 터미널**(xterm, foot, mlterm, SIXEL 패치를 넣은 st 등): 페이저와 파일 브라우저 미리보기에서
+  이미지를 화면 픽셀 그대로, 웹브라우저처럼 선명하게 그립니다. 시작할 때 터미널에 물어(DA1) 자동으로 켭니다.
+  최대 255색으로 줄이며 사진은 디더링합니다. 스크롤로 잘리면 보이는 부분만 그립니다.
+- **그 밖의 터미널**과 `-P` 출력: 반블록 문자(`▀`)와 트루컬러로 그립니다(한 칸에 두 픽셀이라 흐릿합니다).
+- `MDVIEW_IMAGES=sixel`로 강제로 켜거나, `MDVIEW_IMAGES=cells`로 반블록을 쓰게 할 수 있습니다.
+
+st-flexipatch라면 `patches.h`의 `SIXEL_PATCH`를 1로, `config.mk`의 `SIXEL_C`·`SIXEL_LIBS` 줄 주석을 풀고
+(imlib2 필요) 다시 빌드하면 됩니다.
 
 - PNG, JPEG, GIF(첫 장), WebP, BMP. SVG는 그리지 않고 설명만 보입니다.
 - 상대 경로는 문서 파일이 있는 폴더(원격 문서면 그 URL, 표준입력이면 현재 폴더) 기준으로 찾습니다.

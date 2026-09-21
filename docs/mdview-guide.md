@@ -29,7 +29,9 @@ mdview는 [glow](https://github.com/charmbracelet/glow)와 같은 터미널 마�
 - 목록: 순서/비순서/중첩(깊이별 기호 • ◦ ▪)/체크박스(✓ ☐), 느슨한 목록 사이 빈 줄
 - 인용(`│` 막대), 표(정렬, 셀 줄바꿈, 폭 자동 축소), 수평선
 - 링크 `텍스트 (URL)`, 이미지 `🖼 대체텍스트 (URL)`, 각주(문서 끝에 모아 출력)
-- 문단에 홀로 선 이미지(또는 이미지만 담은 HTML 블록)는 반블록 `▀` + 트루컬러로 그림을 그린다.
+- 문단에 홀로 선 이미지(또는 이미지만 담은 HTML 블록)는 그림으로 그린다. sixel 터미널(DA1 응답에 4)이면
+  페이저·미리보기에서 화면 픽셀 그대로(렌더러는 빈 줄로 자리만 잡고 `Placement`를 돌려주며, 출력기가
+  그린 뒤 sixel을 얹는다. 이미지가 움직이면 화면을 지우고 다시 그린다), 아니면 반블록 `▀` + 트루컬러.
   상대 경로는 문서 폴더(원격이면 문서 URL) 기준, 원격은 5초 제한, SVG·색 없는 출력은 대체텍스트만
 - YAML 프론트매터 생략, HTML은 흐리게 그대로 출력
 - 줄바꿈: unicode-width 기반. 한글은 어절(공백) 단위, 한자/가나는 글자 단위, 긴 단어는 강제 분할
@@ -200,7 +202,9 @@ src/
   render/table.rs    표 레이아웃
   render/canvas.rs   문자 격자 캔버스 (박스 문자 이음, 전각 문자 처리)
   render/html_table.rs  HTML <table> (rowspan/colspan 병합)
-  render/image.rs    이미지 → 반블록 픽셀 (경로 해석, 원격 내려받기, 디코딩 캐시)
+  render/image.rs    이미지 읽기(경로 해석, 원격 내려받기, 디코딩 캐시) → 반블록 줄 또는 sixel 자리
+  sixel.rs           sixel 지원 감지(DA1)·칸 픽셀 크기, median cut 색 줄이기 + 디더링, 인코딩
+  output/graphics.rs 화면에 그린 sixel 추적, 스크롤·잘림 처리 (페이저·미리보기 공용)
   render/math/       LaTeX 수식: layout.rs(2차원 상자 모델) · symbols.rs(기호 표) · mod.rs(파서)
   render/mermaid/    mermaid: graph.rs(계층 배치) · flow/state/er/class(그래프 계열 파서)
                      · sequence · gantt · pie · git · parse.rs(공통 도우미)

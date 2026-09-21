@@ -1,10 +1,11 @@
-//! 이미지를 반블록(`▀`) 문자와 트루컬러로 그린다.
+//! 문서 속 이미지를 읽어 그린다.
 //!
-//! 한 칸에 위아래 두 픽셀을 담는다: 글자색이 윗 픽셀, 배경색이 아랫 픽셀.
-//! 그래픽 프로토콜(kitty, sixel)이 없는 터미널에서도 보이고, 문서 모델의 줄로
-//! 나오므로 페이저·미리보기·그대로 출력 어디서나 같은 방식으로 쓴다.
+//! - 픽셀 모드: sixel을 아는 터미널에서 페이저가 화면 픽셀 그대로 그린다. 렌더러는 자리만 비워 둔다.
+//! - 칸 모드: 반블록(`▀`) 문자와 트루컬러로 그린다. 한 칸에 위아래 두 픽셀을 담는다
+//!   (글자색이 윗 픽셀, 배경색이 아랫 픽셀). 그래픽 프로토콜이 없어도 보인다.
 
 use crate::doc::{Color, Line, Span, Style};
+use crate::sixel::{self, Indexed};
 use image::RgbaImage;
 use image::imageops::FilterType;
 use std::collections::HashMap;
@@ -21,18 +22,49 @@ pub enum ImageBase {
     Url(String),
 }
 
-/// 읽어 둔 이미지의 최대 크기(픽셀). 터미널 폭보다 넉넉하면 충분하다.
-const MAX_W: u32 = 480;
-const MAX_H: u32 = 960;
+/// 어떻게 그릴지.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMode {
+    /// 반블록 문자
+    Cells,
+    /// sixel. 글자 한 칸의 픽셀 크기를 함께 둔다.
+    Pixels { cell_w: u32, cell_h: u32 },
+}
+
+/// 이미지를 그리는 데 필요한 설정.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Images {
+    pub base: ImageBase,
+    pub mode: ImageMode,
+}
+
+/// 그린 결과.
+pub enum Picture {
+    /// 반블록 줄들
+    Cells(Vec<Line>),
+    /// `rows` 줄의 자리만 잡고, 실제 픽셀은 출력기가 그린다.
+    Pixels { rows: usize, cell_h: u32, image: Arc<Indexed> },
+}
+
+/// 읽어 둔 이미지의 최대 크기(픽셀). 화면보다 넉넉하면 충분하다.
+const MAX_W: u32 = 2048;
+const MAX_H: u32 = 2048;
 /// 원격 이미지 최대 크기(바이트)
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// 캐시가 이만큼 넘으면 비운다.
-const CACHE_LIMIT: usize = 64;
+const CACHE_LIMIT: usize = 16;
 
 type Cache = Mutex<HashMap<String, Option<Arc<RgbaImage>>>>;
+/// 화면 크기로 줄이고 색을 줄인 이미지: (원본 키, 가로, 세로) → 결과
+type SixelCache = Mutex<HashMap<(String, u32, u32), Arc<Indexed>>>;
 
 fn cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sixel_cache() -> &'static SixelCache {
+    static CACHE: OnceLock<SixelCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -110,18 +142,23 @@ fn cache_key(loc: &Loc) -> String {
 }
 
 fn load(loc: &Loc) -> Option<Arc<RgbaImage>> {
+    load_keyed(loc).map(|(_, img)| img)
+}
+
+/// 이미지와 그 캐시 키.
+fn load_keyed(loc: &Loc) -> Option<(String, Arc<RgbaImage>)> {
     let key = cache_key(loc);
     if let Some(hit) = cache().lock().ok()?.get(&key) {
-        return hit.clone();
+        return hit.clone().map(|img| (key, img));
     }
     let img = read_bytes(loc).and_then(|b| decode(&b)).map(Arc::new);
     if let Ok(mut c) = cache().lock() {
         if c.len() >= CACHE_LIMIT {
             c.clear();
         }
-        c.insert(key, img.clone());
+        c.insert(key.clone(), img.clone());
     }
-    img
+    img.map(|img| (key, img))
 }
 
 fn read_bytes(loc: &Loc) -> Option<Vec<u8>> {
@@ -155,10 +192,44 @@ fn decode(bytes: &[u8]) -> Option<RgbaImage> {
 }
 
 /// 이미지를 읽어 `width` 칸, 최대 `max_rows` 줄 안에 맞춰 그린다. 읽지 못하면 None.
-pub fn render(src: &str, base: &ImageBase, width: usize, max_rows: usize) -> Option<Vec<Line>> {
-    let loc = resolve(src, base)?;
-    let img = load(&loc)?;
-    Some(to_lines(&img, width, max_rows))
+pub fn render(src: &str, images: &Images, width: usize, max_rows: usize) -> Option<Picture> {
+    let loc = resolve(src, &images.base)?;
+    match images.mode {
+        ImageMode::Cells => {
+            let img = load(&loc)?;
+            Some(Picture::Cells(to_lines(&img, width, max_rows)))
+        }
+        ImageMode::Pixels { cell_w, cell_h } => {
+            let (key, img) = load_keyed(&loc)?;
+            let (pw, ph) = fit_pixels(img.width(), img.height(), width as u32 * cell_w, max_rows as u32 * cell_h);
+            // sixel은 6픽셀 단위로 그려지므로 올림한 높이까지 자리를 잡아 아래 줄을 덮지 않게 한다.
+            let rows = (ph.div_ceil(6) * 6).div_ceil(cell_h) as usize;
+            let ck = (key, pw, ph);
+            let hit = sixel_cache().lock().ok().and_then(|c| c.get(&ck).cloned());
+            let image = match hit {
+                Some(i) => i,
+                None => {
+                    let small = if (pw, ph) == img.dimensions() { (*img).clone() } else { image::imageops::resize(&*img, pw, ph, FilterType::CatmullRom) };
+                    let i = Arc::new(sixel::quantize(&small));
+                    if let Ok(mut c) = sixel_cache().lock() {
+                        if c.len() >= CACHE_LIMIT {
+                            c.clear();
+                        }
+                        c.insert(ck, i.clone());
+                    }
+                    i
+                }
+            };
+            Some(Picture::Pixels { rows, cell_h, image })
+        }
+    }
+}
+
+/// 화면에 그릴 픽셀 크기: 원본보다 키우지 않고 `max_w` × `max_h` 안에 비율을 지켜 넣는다.
+fn fit_pixels(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(1) as f64, h.max(1) as f64);
+    let scale = (max_w.max(1) as f64 / w).min(max_h.max(1) as f64 / h).min(1.0);
+    (((w * scale).round() as u32).max(1), ((h * scale).round() as u32).max(1))
 }
 
 /// 표시할 칸 수와 줄 수. 한 칸이 가로 1 × 세로 2 픽셀이라 줄 수는 픽셀 높이의 절반이다.
@@ -288,6 +359,13 @@ mod tests {
         assert_eq!(fit(10, 10, 80, 40), (10, 5));
         // 세로로 긴 이미지는 줄 수에 맞춰 줄인다
         assert_eq!(fit(100, 1000, 80, 20), (4, 20));
+    }
+
+    #[test]
+    fn fits_pixels_without_upscaling() {
+        assert_eq!(fit_pixels(400, 200, 1000, 1000), (400, 200));
+        assert_eq!(fit_pixels(2000, 1000, 1000, 1000), (1000, 500));
+        assert_eq!(fit_pixels(1000, 2000, 1000, 500), (250, 500));
     }
 
     #[test]

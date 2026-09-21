@@ -979,13 +979,14 @@ dependencies = [
 
 [[package]]
 name = "mdview"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "clap",
  "crossterm",
  "ignore",
  "image",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "serde",

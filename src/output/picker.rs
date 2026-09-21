@@ -6,7 +6,9 @@
 //! 미리보기 창 폭은 구분선을 마우스로 끌어 바꾼다.
 
 use crate::output::tree::{self, Row};
+use crate::output::graphics::ImageLayer;
 use crate::output::tui_convert;
+use crate::render::Placement;
 use crate::output::watch::{Snapshot, Watcher};
 use crate::source::{self, Source, Stamp};
 use crate::stash::Stash;
@@ -67,7 +69,14 @@ struct PreviewCache {
     key: (String, usize),
     /// 렌더링할 때의 파일 표식. 달라지면 같은 문서라도 다시 그린다.
     stamp: Option<Stamp>,
+    preview: Preview,
+}
+
+/// 미리보기 내용: 줄들과, 그 위에 픽셀로 그릴 이미지 자리.
+#[derive(Default)]
+struct Preview {
     lines: Vec<Line<'static>>,
+    images: Vec<Placement>,
 }
 
 pub struct Picker {
@@ -108,6 +117,10 @@ pub struct Picker {
     body_area: Rect,
     list_area: Rect,
     preview_area: Option<Rect>,
+    /// 마지막으로 그린 미리보기 글 영역(테두리·여백 안쪽). 이미지 위치의 기준이다.
+    preview_inner: Option<Rect>,
+    /// 미리보기 위에 그려 둔 이미지들
+    layer: ImageLayer,
     /// 목록 자동 갱신용 백그라운드 감시기(테스트에서는 없다)
     watcher: Option<Watcher>,
     /// 마지막으로 반영한 파일 표식. 다음 스냅숏과 비교하는 기준
@@ -174,6 +187,8 @@ impl Picker {
             body_area: Rect::default(),
             list_area: Rect::default(),
             preview_area: None,
+            preview_inner: None,
+            layer: ImageLayer::default(),
             watcher: None,
             stamps: Vec::new(),
             baseline: false,
@@ -793,6 +808,29 @@ impl Picker {
     // ------------------------------------------------------------ 입력 처리
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<PickerExit> {
+        // 페이저에서 돌아왔으면 화면이 새로 그려졌으니 이미지를 다시 보낸다.
+        self.layer.forget();
+        let exit = self.run_loop(terminal);
+        self.layer.clear(terminal)?;
+        exit
+    }
+
+    /// 미리보기의 이미지를 지금 스크롤 위치에 맞춘다. 미리보기가 안 보이면 지운다.
+    fn sync_images(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let (images, area) = match (self.preview_inner, &self.cache) {
+            (Some(area), Some(c)) => (c.preview.images.clone(), area),
+            _ => (Vec::new(), Rect::default()),
+        };
+        let mut layer = std::mem::take(&mut self.layer);
+        let result = layer.sync(terminal, &images, area, self.preview_scroll, |t| {
+            t.draw(|f| self.draw(f))?;
+            Ok(())
+        });
+        self.layer = layer;
+        result
+    }
+
+    fn run_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<PickerExit> {
         // 페이저에서 돌아왔을 때 스태시가 바뀌었을 수 있다.
         self.rebuild();
         loop {
@@ -801,6 +839,7 @@ impl Picker {
                 self.apply_snapshot(snap);
             }
             terminal.draw(|f| self.draw(f))?;
+            self.sync_images(terminal)?;
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
@@ -810,6 +849,11 @@ impl Picker {
                     if matches!(self.mode, Mode::Normal) {
                         self.on_mouse(m);
                     }
+                    continue;
+                }
+                // ratatui가 크기 변경 때 화면을 지우므로 이미지는 다시 보내야 한다.
+                Event::Resize(_, _) => {
+                    self.layer.forget();
                     continue;
                 }
                 _ => continue,
@@ -1091,6 +1135,7 @@ impl Picker {
         self.body_area = body;
         self.list_area = list_area;
         self.preview_area = preview_area;
+        self.preview_inner = None;
 
         self.draw_list(f, list_area);
         if let Some(area) = preview_area {
@@ -1223,6 +1268,7 @@ impl Picker {
         let inner = block.inner(area).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
         f.render_widget(block, area);
         self.preview_height = inner.height as usize;
+        self.preview_inner = Some(inner);
         let scroll = self.preview_scroll;
         let height = inner.height as usize;
         let lines = self.preview_lines(inner.width as usize);
@@ -1251,24 +1297,24 @@ impl Picker {
         let same_doc = self.cache.as_ref().is_some_and(|c| c.key == key);
         let fresh = same_doc && self.cache.as_ref().is_some_and(|c| c.stamp == stamp);
         if !fresh {
-            let lines = self.render_preview(&key.0, width, dim);
+            let preview = self.render_preview(&key.0, width, dim);
             // 다른 문서를 고르면 맨 위부터. 같은 문서가 고쳐진 것이면 보던 자리를 지킨다.
             if !same_doc {
                 self.preview_scroll = 0;
             }
-            self.cache = Some(PreviewCache { key, stamp, lines });
+            self.cache = Some(PreviewCache { key, stamp, preview });
         }
-        let len = self.cache.as_ref().map_or(0, |c| c.lines.len());
+        let len = self.cache.as_ref().map_or(0, |c| c.preview.lines.len());
         self.preview_len = len;
         // 내용이 짧아졌으면 스크롤을 끝에 맞춘다.
         self.preview_scroll = self.preview_scroll.min(len.saturating_sub(self.preview_height));
-        &self.cache.as_ref().unwrap().lines
+        &self.cache.as_ref().unwrap().preview.lines
     }
 
-    fn render_preview(&self, key: &str, width: usize, dim: Style) -> Vec<Line<'static>> {
-        let note = |s: &str| vec![Line::from(Span::styled(s.to_string(), dim))];
+    fn render_preview(&self, key: &str, width: usize, dim: Style) -> Preview {
+        let note = |s: &str| Preview { lines: vec![Line::from(Span::styled(s.to_string(), dim))], images: Vec::new() };
         if width < 8 {
-            return Vec::new();
+            return Preview::default();
         }
         if let Some(d) = key.strip_prefix("<dir>") {
             let n = self.rows.iter().filter(|r| matches!(r, Row::Dir { path, .. } if path == &PathBuf::from(d))).count();
@@ -1297,12 +1343,14 @@ impl Picker {
             return note("읽을 수 없습니다");
         };
         let text = crate::hangul::compose(&String::from_utf8_lossy(&bytes));
-        let images = crate::render::image::ImageBase::Dir(path.parent().map(Path::to_path_buf).unwrap_or_default());
-        let mut out: Vec<Line<'static>> = crate::render::render_doc(&text, &self.theme, width, Some(&images)).iter().map(tui_convert::line).collect();
-        if out.is_empty() {
-            out = note("(빈 문서)");
+        use crate::render::image::{ImageBase, ImageMode, Images};
+        let mode = crate::sixel::cell_size().map_or(ImageMode::Cells, |(cell_w, cell_h)| ImageMode::Pixels { cell_w, cell_h });
+        let images = Images { base: ImageBase::Dir(path.parent().map(Path::to_path_buf).unwrap_or_default()), mode };
+        let r = crate::render::render_doc(&text, &self.theme, width, Some(&images));
+        if r.lines.is_empty() {
+            return note("(빈 문서)");
         }
-        out
+        Preview { lines: r.lines.iter().map(tui_convert::line).collect(), images: r.images }
     }
 
     fn draw_footer(&mut self, f: &mut Frame, area: Rect, show_preview: bool) {
@@ -1744,14 +1792,14 @@ mod tests {
     #[test]
     fn preview_of_a_missing_file_reports_the_error() {
         let p = picker(&["gone.md"]);
-        let lines = p.render_preview("/tmp/definitely-not-here.md", 40, Style::default());
+        let lines = p.render_preview("/tmp/definitely-not-here.md", 40, Style::default()).lines;
         assert!(lines[0].spans[0].content.contains("읽을 수 없습니다"));
     }
 
     #[test]
     fn preview_of_a_url_does_not_fetch() {
         let p = picker(&[]);
-        let lines = p.render_preview("https://example.com/a.md", 40, Style::default());
+        let lines = p.render_preview("https://example.com/a.md", 40, Style::default()).lines;
         assert!(lines[0].spans[0].content.contains("Enter"));
     }
 
@@ -1762,7 +1810,7 @@ mod tests {
         let file = dir.join("x.md");
         std::fs::write(&file, "# 제목\n\n본문\n").unwrap();
         let p = picker(&["x.md"]);
-        let lines = p.render_preview(&file.to_string_lossy(), 30, Style::default());
+        let lines = p.render_preview(&file.to_string_lossy(), 30, Style::default()).lines;
         let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(text.iter().any(|l| l.contains("제목")));
         assert!(text.iter().any(|l| l.contains('━')), "제목 밑줄까지 그려진다");

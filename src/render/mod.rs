@@ -12,7 +12,8 @@ use crate::doc::{Line, Span, Style};
 use crate::theme::{Theme, ThemeKind};
 use crate::wrap::wrap_line;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use image::ImageBase;
+use image::{Images, Picture};
+use std::sync::Arc;
 use table::Table;
 
 /// 블록 접두(들여쓰기, 인용 막대, 목록 기호).
@@ -68,14 +69,42 @@ struct Renderer<'t> {
     footnotes: Vec<(String, Vec<Line>)>,
     /// 각주 본문을 잡아두는 동안 잠시 치워둔 (출력, 접두)
     saved: Option<(Vec<Line>, Vec<Prefix>)>,
-    /// 이미지를 찾을 기준. None이면 이미지를 그리지 않고 대체 글만 보인다.
-    image_base: Option<ImageBase>,
+    /// 이미지 설정. None이면 이미지를 그리지 않고 대체 글만 보인다.
+    images: Option<Images>,
+    /// 출력기가 픽셀로 그릴 이미지 자리
+    placements: Vec<Placement>,
     /// 이미지를 그릴 최대 줄 수
     image_rows: usize,
     /// 지금 문단에 나온 이미지 주소. 문단이 이미지 하나뿐이면 그림으로 그린다.
     para_image: Option<String>,
     /// 지금 문단에 이미지 말고 다른 내용이 있는지
     para_extra: bool,
+}
+
+/// 출력기가 픽셀(sixel)로 그릴 이미지 한 장의 자리.
+#[derive(Clone)]
+pub struct Placement {
+    /// 이미지가 시작하는 줄
+    pub line: usize,
+    /// 이미지가 시작하는 칸(왼쪽 접두 너비)
+    pub col: usize,
+    /// 차지하는 줄 수
+    pub rows: usize,
+    /// 한 줄의 픽셀 높이
+    pub cell_h: u32,
+    pub image: Arc<crate::sixel::Indexed>,
+}
+
+/// 렌더링 결과: 줄들과, 그 위에 픽셀로 그릴 이미지 자리.
+pub struct Rendered {
+    pub lines: Vec<Line>,
+    pub images: Vec<Placement>,
+}
+
+/// HTML 이미지 블록의 조각.
+enum HtmlPart {
+    Picture(Picture),
+    Line(Line),
 }
 
 /// 이미지 한 장이 차지할 수 있는 최대 줄 수: 터미널 높이에서 조금 뺀 만큼.
@@ -91,12 +120,12 @@ pub fn wrap_plain(s: &str, width: usize) -> Vec<String> {
 /// 마크다운 문자열을 `width` 폭에 맞춘 스타일 줄들로 렌더링한다. 이미지는 대체 글로만 보인다.
 #[cfg(test)]
 pub fn render(markdown: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    render_doc(markdown, theme, width, None)
+    render_doc(markdown, theme, width, None).lines
 }
 
 /// `render`와 같되, `images`가 있으면 홀로 선 이미지를 그림으로 그린다.
 /// 색이 없는 테마에서는 그리지 않는다.
-pub fn render_doc(markdown: &str, theme: &Theme, width: usize, images: Option<&ImageBase>) -> Vec<Line> {
+pub fn render_doc(markdown: &str, theme: &Theme, width: usize, images: Option<&Images>) -> Rendered {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -127,7 +156,8 @@ pub fn render_doc(markdown: &str, theme: &Theme, width: usize, images: Option<&I
         skip_depth: 0,
         footnotes: Vec::new(),
         saved: None,
-        image_base: images.filter(|_| theme.kind != ThemeKind::NoTty).cloned(),
+        images: images.filter(|_| theme.kind != ThemeKind::NoTty).cloned(),
+        placements: Vec::new(),
         image_rows: image_rows(),
         para_image: None,
         para_extra: false,
@@ -136,7 +166,7 @@ pub fn render_doc(markdown: &str, theme: &Theme, width: usize, images: Option<&I
         r.event(ev);
     }
     r.finish();
-    r.out
+    Rendered { lines: r.out, images: r.placements }
 }
 
 impl<'t> Renderer<'t> {
@@ -241,44 +271,67 @@ impl<'t> Renderer<'t> {
                 self.prefixes.pop();
             }
         }
-        // 마지막 빈 줄 제거
-        while self.out.last().is_some_and(|l| l.is_empty() || l.plain().trim().is_empty()) {
+        // 마지막 빈 줄 제거. 이미지 자리는 비어 보여도 남긴다.
+        let keep = self.placements.iter().map(|p| p.line + p.rows).max().unwrap_or(0);
+        while self.out.len() > keep && self.out.last().is_some_and(|l| l.is_empty() || l.plain().trim().is_empty()) {
             self.out.pop();
         }
     }
 
-    /// 이미지를 읽어 그린 줄들. 그릴 수 없으면 None.
-    fn picture(&self, src: &str) -> Option<Vec<Line>> {
-        let base = self.image_base.as_ref()?;
-        image::render(src, base, self.avail(), self.image_rows)
+    /// 이미지를 읽어 그린다. 그릴 수 없으면 None.
+    fn picture(&self, src: &str) -> Option<Picture> {
+        let images = self.images.as_ref()?;
+        image::render(src, images, self.avail(), self.image_rows)
     }
 
-    /// 이미지만 담은 HTML 블록(`<p align="center"><img src=...></p>` 등)을 그린다.
+    /// 그림을 출력에 넣는다. 픽셀 그림은 빈 줄로 자리를 잡고 위치를 적어 둔다.
+    fn emit_picture(&mut self, pic: Picture) {
+        match pic {
+            Picture::Cells(lines) => {
+                for l in lines {
+                    self.emit(l);
+                }
+            }
+            // 각주 본문은 나중에 옮겨 붙으므로 줄 위치를 알 수 없다. 대체 글만 남긴다.
+            Picture::Pixels { .. } if self.saved.is_some() => {}
+            Picture::Pixels { rows, cell_h, image } => {
+                let placement = Placement { line: self.out.len(), col: self.prefix_width(), rows, cell_h, image };
+                for _ in 0..rows {
+                    self.emit(Line::new());
+                }
+                self.placements.push(placement);
+            }
+        }
+    }
+
+    /// 이미지만 담은 HTML 블록(`<p align="center"><img src=...></p>` 등)의 그림들.
     /// 글이 섞였거나 하나도 그리지 못하면 None.
-    fn html_pictures(&self, html: &str) -> Option<Vec<Line>> {
-        self.image_base.as_ref()?;
+    fn html_pictures(&self, html: &str) -> Option<Vec<HtmlPart>> {
+        self.images.as_ref()?;
         let srcs = image::html_img_srcs(html);
         if srcs.is_empty() || !image::html_has_no_text(html) {
             return None;
         }
         let mut out = Vec::new();
+        let mut drawn = false;
         for src in &srcs {
             match self.picture(src) {
                 Some(pic) => {
                     if !out.is_empty() {
-                        out.push(Line::new());
+                        out.push(HtmlPart::Line(Line::new()));
                     }
-                    out.extend(pic);
+                    out.push(HtmlPart::Picture(pic));
+                    drawn = true;
                 }
                 None => {
                     let st = self.theme.image;
                     let mut l = Line::from_spans(vec![Span::new("🖼 ", st)]);
                     l.push(Span::new(format!("({src})"), st.merge(self.theme.link_url)));
-                    out.push(l);
+                    out.push(HtmlPart::Line(l));
                 }
             }
         }
-        out.iter().any(|l| !l.plain().starts_with("🖼")).then_some(out)
+        drawn.then_some(out)
     }
 
     fn heading_level(level: HeadingLevel) -> usize {
@@ -528,9 +581,7 @@ impl<'t> Renderer<'t> {
                 {
                     // 대체 글과 주소는 그림 아래 설명으로 남긴다.
                     self.blank_if_needed();
-                    for l in pic {
-                        self.emit(l);
-                    }
+                    self.emit_picture(pic);
                 }
                 self.flush_inline();
                 self.need_blank = true;
@@ -659,13 +710,19 @@ impl<'t> Renderer<'t> {
                 if let Some(buf) = self.html_block.take() {
                     self.blank_if_needed();
                     // `<table>` 이면 표로, 이미지만 있으면 그림으로 그리고, 아니면 원문을 그대로 보여준다.
-                    match html_table::render(&buf, self.theme, self.avail()).or_else(|| self.html_pictures(&buf)) {
-                        Some(lines) => {
-                            for l in lines {
-                                self.emit(l);
+                    if let Some(lines) = html_table::render(&buf, self.theme, self.avail()) {
+                        for l in lines {
+                            self.emit(l);
+                        }
+                    } else if let Some(parts) = self.html_pictures(&buf) {
+                        for part in parts {
+                            match part {
+                                HtmlPart::Picture(p) => self.emit_picture(p),
+                                HtmlPart::Line(l) => self.emit(l),
                             }
                         }
-                        None => {
+                    } else {
+                        {
                             // 표가 아니면 원문을 폭에 맞춰 그대로 보여준다.
                             let st = self.theme.html;
                             let avail = self.avail();
@@ -800,18 +857,33 @@ mod tests {
 
     #[test]
     fn standalone_image_is_drawn() {
+        use crate::render::image::{ImageBase, ImageMode};
         let dir = std::env::temp_dir().join(format!("mdview-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ::image::RgbaImage::from_pixel(8, 4, ::image::Rgba([255, 0, 0, 255])).save(dir.join("a.png")).unwrap();
-        let base = ImageBase::Dir(dir.clone());
-        let out: Vec<String> = render_doc("![alt](a.png)", &Theme::dark(), 80, Some(&base)).iter().map(|l| l.plain().trim_start().to_string()).collect();
-        assert_eq!(out, vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀", "🖼 alt (a.png)"], "그림 아래에 대체 글이 남는다");
+        let cells = Images { base: ImageBase::Dir(dir.clone()), mode: ImageMode::Cells };
+        let plain = |md: &str, theme: &Theme, images: &Images| -> Vec<String> {
+            render_doc(md, theme, 80, Some(images)).lines.iter().map(|l| l.plain().trim_start().to_string()).collect()
+        };
+        assert_eq!(plain("![alt](a.png)", &Theme::dark(), &cells), vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀", "🖼 alt (a.png)"], "그림 아래에 대체 글이 남는다");
         // 글 속 이미지와 없는 파일, 색 없는 테마는 대체 글만 보인다.
-        assert_eq!(render_doc("see ![alt](a.png)", &Theme::dark(), 80, Some(&base)).len(), 1);
-        assert_eq!(render_doc("![alt](none.png)", &Theme::dark(), 80, Some(&base)).len(), 1);
-        assert_eq!(render_doc("![alt](a.png)", &Theme::notty(), 80, Some(&base)).len(), 1);
-        let html: Vec<String> = render_doc("<p align=\"center\"><img src=\"a.png\"></p>", &Theme::dark(), 80, Some(&base)).iter().map(|l| l.plain().trim_start().to_string()).collect();
-        assert_eq!(html, vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀"]);
+        assert_eq!(plain("see ![alt](a.png)", &Theme::dark(), &cells).len(), 1);
+        assert_eq!(plain("![alt](none.png)", &Theme::dark(), &cells).len(), 1);
+        assert_eq!(plain("![alt](a.png)", &Theme::notty(), &cells).len(), 1);
+        assert_eq!(plain("<p align=\"center\"><img src=\"a.png\"></p>", &Theme::dark(), &cells), vec!["▀▀▀▀▀▀▀▀", "▀▀▀▀▀▀▀▀"]);
+
+        // 픽셀 모드는 빈 줄로 자리를 잡고 위치를 알려 준다. 칸이 4×2 픽셀이면 8×4 그림은
+        // sixel 6픽셀 단위로 올린 높이(6)를 담도록 3줄.
+        let pixels = Images { base: ImageBase::Dir(dir.clone()), mode: ImageMode::Pixels { cell_w: 4, cell_h: 2 } };
+        let r = render_doc("# 제목\n\n![alt](a.png)", &Theme::dark(), 80, Some(&pixels));
+        assert_eq!(r.images.len(), 1);
+        let p = &r.images[0];
+        assert_eq!((p.line, p.rows, p.col, p.image.width, p.image.height), (3, 3, 2, 8, 4));
+        assert!(r.lines[3..6].iter().all(Line::is_empty));
+        assert_eq!(r.lines[6].plain().trim(), "🖼 alt (a.png)");
+        // 문서 끝의 HTML 그림은 비어 보여도 자리가 잘리지 않는다.
+        let r = render_doc("<img src=\"a.png\">", &Theme::dark(), 80, Some(&pixels));
+        assert_eq!((r.lines.len(), r.images.len()), (3, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

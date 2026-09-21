@@ -3,6 +3,7 @@ mod doc;
 mod hangul;
 mod output;
 mod render;
+mod sixel;
 mod source;
 mod stash;
 mod theme;
@@ -12,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{Cli, Command, StashArgs, StyleArg};
 use output::pager::{Pager, PagerExit};
+use render::image::{ImageBase, ImageMode, Images};
 use output::picker::{Picker, PickerExit};
 use source::{Document, Source};
 use stash::Stash;
@@ -185,8 +187,9 @@ fn stash_command(args: &StashArgs) -> Result<()> {
 
 fn print_document(cli: &Cli, theme: &Theme, doc: &Document) -> Result<()> {
     let width = content_width(cli);
-    let images = image_base(&doc.source);
-    let lines = render::render_doc(&doc.text, theme, width, Some(&images));
+    // 그대로 출력할 때는 반블록으로 그린다.
+    let images = Images { base: image_base(&doc.source), mode: ImageMode::Cells };
+    let lines = render::render_doc(&doc.text, theme, width, Some(&images)).lines;
     let mut s = output::ansi::to_string(&lines);
     if !s.is_empty() {
         s.insert(0, '\n');
@@ -206,6 +209,8 @@ fn print_document(cli: &Cli, theme: &Theme, doc: &Document) -> Result<()> {
 
 fn init_terminal() -> ratatui::DefaultTerminal {
     let terminal = ratatui::init();
+    // 원시 모드가 켜진 뒤, 이벤트를 읽기 전에 sixel 지원을 물어 둔다.
+    sixel::detect();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     terminal
 }
@@ -232,18 +237,19 @@ fn open_pager(
     };
     let theme = theme.clone();
     let fixed_width = cli.width;
-    let images = image_base(&doc.source);
+    let base = image_base(&doc.source);
     let rerender = Box::new(move |term_w: usize| {
         let w = if fixed_width > 0 { fixed_width.min(term_w) } else { term_w.min(MAX_WIDTH) };
-        render::render_doc(&text.borrow(), &theme, w, Some(&images))
+        // 글꼴 크기가 바뀌었을 수 있으니 칸 크기는 다시 그릴 때마다 읽는다.
+        let mode = sixel::cell_size().map_or(ImageMode::Cells, |(cell_w, cell_h)| ImageMode::Pixels { cell_w, cell_h });
+        render::render_doc(&text.borrow(), &theme, w, Some(&Images { base: base.clone(), mode }))
     });
     let mut pager = Pager::new(doc.title, terminal_width(), rerender, from_picker, stash, doc.source.stash_key(), reload);
     pager.run(terminal)
 }
 
 /// 문서 안 상대 경로 이미지를 찾을 기준: 파일은 그 폴더, 원격은 내려받은 URL, 표준입력은 현재 폴더.
-fn image_base(src: &Source) -> render::image::ImageBase {
-    use render::image::ImageBase;
+fn image_base(src: &Source) -> ImageBase {
     match src {
         Source::File(p) => ImageBase::Dir(p.parent().map(Path::to_path_buf).unwrap_or_default()),
         Source::Url(u) => ImageBase::Url(source::normalize_url(u)),

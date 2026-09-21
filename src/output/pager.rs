@@ -1,13 +1,15 @@
 //! ratatui 기반 페이저: 스크롤, 검색, 종료.
 
 use crate::doc::Line;
+use crate::output::graphics::ImageLayer;
 use crate::output::tui_convert;
+use crate::render::{Placement, Rendered};
 use crate::stash::Stash;
 use std::cell::RefCell;
 use std::rc::Rc;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span};
 use ratatui::widgets::Paragraph;
@@ -32,7 +34,13 @@ pub struct Pager {
     /// 파일 브라우저에서 열렸는지 (Esc/Backspace로 돌아갈 수 있음)
     from_picker: bool,
     /// 폭 변경 시 다시 렌더링하기 위한 콜백
-    rerender: Box<dyn Fn(usize) -> Vec<Line>>,
+    rerender: Box<dyn Fn(usize) -> Rendered>,
+    /// 픽셀(sixel)로 그릴 이미지 자리
+    images: Vec<Placement>,
+    /// 화면에 그려 둔 이미지들
+    layer: ImageLayer,
+    /// 마지막으로 그린 본문 영역
+    body: Rect,
     width: usize,
     stash: Rc<RefCell<Stash>>,
     /// 스태시에 저장할 식별자. 표준입력 문서는 None.
@@ -48,18 +56,21 @@ impl Pager {
     pub fn new(
         title: String,
         width: usize,
-        rerender: Box<dyn Fn(usize) -> Vec<Line>>,
+        rerender: Box<dyn Fn(usize) -> Rendered>,
         from_picker: bool,
         stash: Rc<RefCell<Stash>>,
         stash_key: Option<String>,
         reload: Option<Box<dyn FnMut() -> bool>>,
     ) -> Self {
-        let lines = rerender(width);
+        let Rendered { lines, images } = rerender(width);
         let rendered = lines.iter().map(tui_convert::line).collect();
         Pager {
             title,
             lines,
             rendered,
+            images,
+            layer: ImageLayer::default(),
+            body: Rect::default(),
             scroll: 0,
             search: None,
             search_input: None,
@@ -99,8 +110,7 @@ impl Pager {
     fn set_width(&mut self, w: usize) {
         if w != self.width && w > 0 {
             self.width = w;
-            self.lines = (self.rerender)(w);
-            self.rendered = self.lines.iter().map(tui_convert::line).collect();
+            self.apply((self.rerender)(w));
             self.scroll = self.scroll.min(self.lines.len().saturating_sub(1));
             self.recompute_matches();
         }
@@ -110,11 +120,28 @@ impl Pager {
     fn reload_if_changed(&mut self) {
         let Some(reload) = self.reload.as_mut() else { return };
         if reload() {
-            self.lines = (self.rerender)(self.width);
-            self.rendered = self.lines.iter().map(tui_convert::line).collect();
+            self.apply((self.rerender)(self.width));
             self.recompute_matches();
             self.set_status("파일이 바뀌어 다시 불러왔습니다");
         }
+    }
+
+    fn apply(&mut self, r: Rendered) {
+        self.rendered = r.lines.iter().map(tui_convert::line).collect();
+        self.lines = r.lines;
+        self.images = r.images;
+    }
+
+    /// 화면의 이미지를 지금 스크롤 위치에 맞춘다.
+    fn sync_images(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut layer = std::mem::take(&mut self.layer);
+        let images = self.images.clone();
+        let result = layer.sync(terminal, &images, self.body, self.scroll, |t| {
+            t.draw(|f| self.draw(f))?;
+            Ok(())
+        });
+        self.layer = layer;
+        result
     }
 
     fn recompute_matches(&mut self) {
@@ -152,9 +179,16 @@ impl Pager {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<PagerExit> {
+        let exit = self.run_loop(terminal);
+        self.layer.clear(terminal)?;
+        exit
+    }
+
+    fn run_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<PagerExit> {
         loop {
             self.reload_if_changed();
             terminal.draw(|f| self.draw(f))?;
+            self.sync_images(terminal)?;
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
@@ -211,7 +245,8 @@ impl Pager {
                     event::MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
                     _ => {}
                 },
-                Event::Resize(_, _) => {}
+                // ratatui가 크기 변경 때 화면을 지우므로 이미지는 다시 보내야 한다.
+                Event::Resize(_, _) => self.layer.forget(),
                 _ => {}
             }
         }
@@ -222,6 +257,7 @@ impl Pager {
         let [header, body, footer] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(area);
         self.set_width(area.width as usize);
 
+        self.body = body;
         let page = body.height as usize;
         self.scroll = self.scroll.min(self.max_scroll(page));
 
