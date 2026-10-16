@@ -251,7 +251,15 @@ fn decode(bytes: &[u8]) -> Option<RgbaImage> {
 
 /// 이미지를 읽어 `width` 칸, 최대 `max_rows` 줄 안에 맞춰 그린다. 읽지 못하면 None.
 pub fn render(src: &str, images: &Images, width: usize, max_rows: usize) -> Option<Picture> {
-    let loc = resolve(src, &images.base)?;
+    render_loc(resolve(src, &images.base)?, images, width, max_rows)
+}
+
+/// 이미 가진 이미지 바이트(PNG 등)를 `render`처럼 그린다.
+pub fn render_bytes(bytes: Vec<u8>, images: &Images, width: usize, max_rows: usize) -> Option<Picture> {
+    render_loc(Loc::Data(bytes), images, width, max_rows)
+}
+
+fn render_loc(loc: Loc, images: &Images, width: usize, max_rows: usize) -> Option<Picture> {
     match images.mode {
         ImageMode::Cells => {
             let img = load(&loc)?;

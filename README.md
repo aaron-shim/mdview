@@ -48,7 +48,7 @@ cargo install --path .
 
 ```sh
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mdview_0.3.8_amd64.deb   # 아키텍처에 따라 arm64 등
+sudo apt install ./dist/mdview_0.3.9_amd64.deb   # 아키텍처에 따라 arm64 등
 ```
 
 `.deb`는 `/usr/bin/mdview`와 `/usr/share/doc/mdview/`에 설치되며, `sudo apt remove mdview`로 제거합니다.
@@ -345,6 +345,11 @@ Local·Stashed 목록(파일 이름·디렉터리·메모·이름 필터)과 페
 터미널은 세로로 길고 가로로 좁으므로, 그래프 계열은 `LR`/`TB` 지정과 무관하게 항상 위에서 아래로 배치합니다.
 라벨 폭을 줄여도 터미널 폭에 들어가지 않거나 지원하지 않는 종류(`mindmap`, `journey` 등)이면
 원문 코드블록을 그대로 보여줍니다.
+
+폭을 넘는 그림은 [mermaid-cli](https://github.com/mermaid-js/mermaid-cli)(`mmdc`)가 있으면 sixel 터미널에서
+mermaid.js와 똑같은 그림을 이미지로 보여줍니다(`npm install -g @mermaid-js/mermaid-cli`). `mmdc`는
+`$MDVIEW_MMDC` → `PATH` → nvm(`~/.nvm`, `~/.config/nvm`)·`~/.npm-global/bin` 등에서 찾으므로 셸 밖에서 띄워도 됩니다.
+그린 그림은 `$XDG_CACHE_HOME/mdview/mermaid/`에 두고 다시 씁니다. 반블록 모드(`--print` 등)에서는 원문 코드블록입니다.
 
 ## 개발
 

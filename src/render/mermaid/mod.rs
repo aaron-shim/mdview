@@ -13,6 +13,7 @@ pub mod flow;
 pub mod gantt;
 pub mod git;
 pub mod graph;
+pub mod mmdc;
 pub mod parse;
 pub mod pie;
 pub mod sequence;
@@ -73,6 +74,11 @@ pub fn render(src: &str, theme: &Theme, width: usize) -> Option<Vec<Line>> {
         out.pop();
     }
     Some(out)
+}
+
+/// 다이어그램을 이미지로 그릴 때 위에 붙일 머리말. 종류를 모르면 `None`.
+pub fn image_caption(src: &str, theme: &Theme, width: usize) -> Option<Line> {
+    Some(caption(kind_of(src)?, theme, width))
 }
 
 /// 다이어그램 머리말.

@@ -12,7 +12,7 @@ use crate::doc::{Line, Span, Style};
 use crate::theme::{Theme, ThemeKind};
 use crate::wrap::wrap_line;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use image::{Images, Picture};
+use image::{ImageMode, Images, Picture};
 use std::sync::Arc;
 use table::Table;
 
@@ -282,6 +282,21 @@ impl<'t> Renderer<'t> {
     fn picture(&self, src: &str) -> Option<Picture> {
         let images = self.images.as_ref()?;
         image::render(src, images, self.avail(), self.image_rows)
+    }
+
+    /// mermaid를 `mmdc`로 그린 그림과 그 머리말. 화면 픽셀로 그릴 수 있을 때만 쓴다:
+    /// 반블록으로 줄이면 글자를 읽을 수 없어 차라리 원문이 낫다.
+    fn mermaid_picture(&self, src: &str) -> Option<(Line, Picture)> {
+        let images = self.images.as_ref().filter(|i| matches!(i.mode, ImageMode::Pixels { .. }))?;
+        // 각주 안에서는 픽셀 그림 자리를 잡을 수 없다.
+        if self.saved.is_some() {
+            return None;
+        }
+        let width = self.avail().saturating_sub(2);
+        let caption = mermaid::image_caption(src, self.theme, width)?;
+        let png = mermaid::mmdc::png(src)?;
+        let pic = image::render_bytes(png.to_vec(), images, width, self.image_rows)?;
+        Some((caption, pic))
     }
 
     /// 그림을 출력에 넣는다. 픽셀 그림은 빈 줄로 자리를 잡고 위치를 적어 둔다.
@@ -620,6 +635,17 @@ impl<'t> Renderer<'t> {
                     for l in diagram {
                         self.emit(l);
                     }
+                    self.prefixes.pop();
+                    self.need_blank = true;
+                    return;
+                }
+                // 글자로는 폭이 모자라면 mermaid-cli 그림으로 보여준다.
+                if lang.trim().eq_ignore_ascii_case("mermaid")
+                    && let Some((caption, pic)) = self.mermaid_picture(&buf)
+                {
+                    self.prefixes.push(Prefix::same(vec![Span::raw("  ")]));
+                    self.emit(caption);
+                    self.emit_picture(pic);
                     self.prefixes.pop();
                     self.need_blank = true;
                     return;
@@ -984,6 +1010,25 @@ mod integration {
         let out: Vec<String> = render("```mermaid\nflowchart TB\n A --> B\n```", &Theme::notty(), 60).iter().map(Line::plain).collect();
         assert!(out[0].contains("mermaid · flowchart"));
         assert!(out.iter().any(|l| l.contains('▼')));
+    }
+
+    /// 글자로 그리기엔 넓은 mermaid는 픽셀 모드에서 `mmdc` 그림이 되고, 반블록 모드에서는 원문으로 남는다.
+    /// 크롬을 띄우므로 `mmdc`가 있을 때 `cargo test -- --ignored`로 돌린다.
+    #[test]
+    #[ignore]
+    fn wide_mermaid_becomes_mmdc_picture() {
+        use crate::render::image::{ImageBase, ImageMode};
+        let nodes: String = (0..12).map(|i| format!(" A --> N{i}[아주 긴 노드 이름 {i}<br>VeryLongPhysicalName{i}]\n")).collect();
+        let md = format!("```mermaid\nflowchart TB\n{nodes}```");
+        let base = ImageBase::Dir(std::env::temp_dir());
+        let pixels = Images { base: base.clone(), mode: ImageMode::Pixels { cell_w: 10, cell_h: 20 } };
+        let r = render_doc(&md, &Theme::dark(), 80, Some(&pixels));
+        assert_eq!(r.images.len(), 1, "그림 자리가 하나 잡힌다");
+        assert!(r.lines[0].plain().contains("mermaid · flowchart"));
+        let cells = Images { base, mode: ImageMode::Cells };
+        let r = render_doc(&md, &Theme::dark(), 80, Some(&cells));
+        assert!(r.images.is_empty());
+        assert!(r.lines.iter().any(|l| l.plain().contains("flowchart TB")), "원문 코드로 남는다");
     }
 
     #[test]
